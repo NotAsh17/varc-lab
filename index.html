@@ -590,6 +590,2575 @@ main{padding:32px 36px;overflow-y:auto}
 <script>
 /* ── CONFIG ──────────────────────────────────────────────────────── */
 // Supabase — replace with your project details
+const SUPA_URL = 'https://YOUR_PROJECT.supabase.co';
+const SUPA_KEY = 'your-anon-key-here';
+const SUPA_OK  = () => !SUPA_URL.includes('YOUR_PROJECT');
+
+/* ── QUESTION BANK ──────────────────────────────────────────────── */
+let BANK = null;  // loaded from question_bank.json
+let metaData = null;
+let allPassages = [];
+
+// Type mapping: bank format → app format
+const TYPE_MAP = { para_jumble:'para_jumbles', summary:'para_summary', odd_one_out:'sentence_out_of_context', para_completion:'para_completion', rc:'rc', sentence_correction:'rc', fill_in_blanks:'rc', critical_reasoning:'rc' };
+const TYPE_UNMAP = { para_jumbles:'para_jumble', para_summary:'summary', sentence_out_of_context:'odd_one_out' };
+
+// Normalize a bank question into the format the session engine expects
+function normQ(q, passage, passageId, source) {
+  const bankType = q.type || (passage ? 'rc' : 'unknown');
+  const appType = TYPE_MAP[bankType] || bankType;
+  const opts = q.options || {};
+  const optKeys = Object.keys(opts).sort((a,b) => a-b);
+  const optArr = optKeys.map(k => opts[k]);
+  const isTITA = optArr.length === 0;
+  
+  // Parse sentences for PJ / OOO from question text
+  let sentences = [];
+  if (['para_jumbles','sentence_out_of_context'].includes(appType)) {
+    const text = q.question || '';
+    const sentRe = /(?:^|\n)\s*([A-F1-5])\.\s+(.+?)(?=(?:\n\s*[A-F1-5]\.\s)|\n*$)/gs;
+    let m;
+    while ((m = sentRe.exec(text)) !== null) {
+      sentences.push({ label: m[1], text: m[2].trim() });
+    }
+    if (!sentences.length) {
+      // Try numbered: "1. text\n2. text"
+      const lines = text.split('\n').filter(l => /^\d+\.\s/.test(l.trim()));
+      sentences = lines.map(l => {
+        const mm = l.trim().match(/^(\d+)\.\s+(.*)/);
+        return mm ? { label: mm[1], text: mm[2] } : null;
+      }).filter(Boolean);
+    }
+  }
+
+  // Find correct_idx for MCQ
+  let correctIdx = null;
+  if (optKeys.length && q.answer) {
+    correctIdx = optKeys.indexOf(String(q.answer));
+    if (correctIdx === -1) correctIdx = null;
+  }
+
+  return {
+    id: q.id || uid(),
+    text: q.question || '',
+    q_type: appType,
+    options: optArr,
+    answer: q.answer ? String(q.answer) : '',
+    explanation: q.explanation || '',
+    _passage: passage || null,
+    _source: source || q.source || '',
+    _passId: passageId || null,
+    format: isTITA ? 'TITA' : 'MCQ',
+    sentences,
+    _correctIdx: correctIdx,
+    _correctVal: q.answer ? String(q.answer) : '',
+    question_number: q.question_number,
+  };
+}
+
+// Seeded random for daily consistency
+function seededRng(seed) {
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) { h = ((h << 5) - h) + seed.charCodeAt(i); h |= 0; }
+  return function() { h ^= h << 13; h ^= h >> 17; h ^= h << 5; return (h >>> 0) / 4294967296; };
+}
+function shuffle(arr, rng) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
+  return a;
+}
+
+/* ── USER ────────────────────────────────────────────────────────── */
+function getCurrentUser() {
+  let u = localStorage.getItem('varc_user');
+  if (!u) {
+    u = prompt('Enter your name (saves your progress):');
+    if (!u) u = 'anon';
+    localStorage.setItem('varc_user', u);
+  }
+  return u;
+}
+function getUserId() {
+  return getCurrentUser().toLowerCase().replace(/[^a-z0-9]/g, '') || 'anon';
+}
+
+/* ── SUPABASE HELPERS ────────────────────────────────────────────── */
+async function supaGet(path) {
+  if (!SUPA_OK()) return [];
+  const r = await fetch(`${SUPA_URL}/rest/v1/${path}`, {
+    headers: { 'apikey': SUPA_KEY, 'Authorization': `Bearer ${SUPA_KEY}` }
+  });
+  return r.ok ? r.json() : [];
+}
+async function supaPost(table, data) {
+  if (!SUPA_OK()) return null;
+  const r = await fetch(`${SUPA_URL}/rest/v1/${table}`, {
+    method: 'POST',
+    headers: { 'apikey': SUPA_KEY, 'Authorization': `Bearer ${SUPA_KEY}`,
+               'Content-Type': 'application/json', 'Prefer': 'return=representation' },
+    body: JSON.stringify(data)
+  });
+  return r.ok ? r.json() : null;
+}
+async function ensureUser() {
+  if (!SUPA_OK()) return;
+  await fetch(`${SUPA_URL}/rest/v1/users`, {
+    method: 'POST',
+    headers: { 'apikey': SUPA_KEY, 'Authorization': `Bearer ${SUPA_KEY}`,
+               'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates' },
+    body: JSON.stringify({ id: getUserId(), name: getCurrentUser() })
+  });
+}
+
+
+// Session state
+const S = {
+  active:false, questions:[], answers:{}, qTimes:{}, flagged:new Set(),
+  cur:0, timer:null, secs:0, paused:false,
+  sessionId:'', title:'', source:'', type:'practice',
+  passageId:null, startTime:null, qStart:null, totalTime:0,
+};
+
+/* ── NAVIGATION ──────────────────────────────────────────────────── */
+function go(page) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('on'));
+  document.querySelectorAll('.nav-link').forEach(n => n.classList.remove('on'));
+  document.getElementById('page-' + page).classList.add('on');
+  const idx = ['home','practice','analytics'].indexOf(page);
+  document.querySelectorAll('.nav-link')[idx]?.classList.add('on');
+  if (page === 'home')      loadHome();
+  if (page === 'practice')  loadPractice();
+  if (page === 'analytics') loadAnalytics();
+}
+
+/* ── HOME ────────────────────────────────────────────────────────── */
+async function loadHome() {
+  const hour = new Date().getHours();
+  const greeting = hour < 12 ? 'Good morning.' : hour < 17 ? 'Good afternoon.' : 'Good evening.';
+  document.getElementById('home-greeting').innerHTML = `<em>${greeting}, ${getCurrentUser()}</em>`;
+  document.getElementById('home-date').textContent =
+    new Date().toLocaleDateString('en-IN',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
+  
+  // Load progress from Supabase or localStorage
+  let sessions = [];
+  if (SUPA_OK()) {
+    sessions = await supaGet(`test_sessions?user_id=eq.${getUserId()}&order=created_at.desc&limit=50`);
+  } else {
+    sessions = JSON.parse(localStorage.getItem('varc_sessions') || '[]');
+  }
+
+  const totalSessions = sessions.length;
+  const totalQs = sessions.reduce((s,t) => s + (t.total_qs||0), 0);
+  const totalCorrect = sessions.reduce((s,t) => s + (t.correct||0), 0);
+  const totalWrong = sessions.reduce((s,t) => s + (t.wrong||0), 0);
+  const acc = totalCorrect + totalWrong > 0 ? Math.round(totalCorrect / (totalCorrect + totalWrong) * 100) : 0;
+  const best = sessions.length ? sessions.reduce((a,b) => (b.score > (a?.score||0) ? b : a), null) : null;
+
+  document.getElementById('st-sessions').textContent = totalSessions || '0';
+  document.getElementById('st-questions').textContent = totalQs || '0';
+  document.getElementById('st-accuracy').textContent = totalSessions ? acc + '%' : '—';
+  document.getElementById('st-score').textContent = best ? `${best.score}/${best.max_score}` : '—';
+
+  const el = document.getElementById('recent-sessions');
+  if (!sessions.length) {
+    el.innerHTML = '<div class="empty">No sessions yet — start with Daily Practice above.</div>';
+    return;
+  }
+  window._recentSessions = sessions.map(s => ({
+    title: s.mode === 'daily' ? 'Daily Practice' : s.mode === 'sectional' ? 'Sectional Mock' : 'Practice',
+    type: s.mode || 'practice', date: s.created_at || new Date().toISOString(),
+    score: s.score || 0, max_score: s.max_score || (s.total_qs || 0) * 3,
+    total_questions: s.total_qs || 0, correct: s.correct || 0, wrong: s.wrong || 0, skipped: s.skipped || 0,
+    accuracy: s.accuracy != null ? Math.round(s.accuracy) : 0,
+    avg_time: s.time_used_sec && s.total_qs ? Math.round(s.time_used_sec / s.total_qs) : 0,
+    results: s._results || [],
+  }));
+
+  el.innerHTML = sessions.slice(0, 8).map((s, i) => {
+    const title = s.mode === 'daily' ? 'Daily Practice' : s.mode === 'sectional' ? 'Sectional Mock' : 'Practice';
+    const date = (s.created_at || new Date().toISOString()).slice(0, 10);
+    const sAcc = s.accuracy != null ? Math.round(s.accuracy) : 0;
+    const sc = s.score || 0;
+    const mx = s.max_score || (s.total_qs || 0) * 3;
+    const tq = s.total_qs || 0;
+    const avgT = s.time_used_sec && tq ? Math.round(s.time_used_sec / tq) : 0;
+    return `<div onclick="openHistoricResult(${i})" style="background:var(--bg1);border:1px solid var(--line);border-radius:var(--r);padding:12px 14px;margin-bottom:7px;display:flex;align-items:center;justify-content:space-between;cursor:pointer;transition:all .14s"
+        onmouseenter="this.style.borderColor='var(--line2)';this.style.background='var(--bg2)'"
+        onmouseleave="this.style.borderColor='var(--line)';this.style.background='var(--bg1)'">
+        <div>
+          <div style="font-size:13px;font-weight:500;margin-bottom:2px">${title}</div>
+          <div style="font-size:11px;color:var(--muted)">${date} · ${tq}Q${avgT ? ' · avg ' + avgT + 's/Q' : ''}</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:14px">
+          <div style="text-align:right">
+            <div style="font-family:'Geist Mono',monospace;font-size:18px;font-weight:500;color:var(--gold)">${sc}<span style="font-size:12px;color:var(--faint);font-weight:400">/${mx}</span></div>
+            <div style="font-size:11px;color:var(--muted)">${sAcc}% acc</div>
+          </div>
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" style="color:var(--faint);flex-shrink:0"><path d="M6 3l5 5-5 5"/></svg>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+/* ── DAILY ───────────────────────────────────────────────────────── */
+let dailyData    = null;   // cached API response
+let dailySections = [];    // [{id, label, questions, done}]
+let dailyDone    = [];     // section ids completed this session
+
+async function startDaily() {
+  if (!BANK) { toast('Questions still loading…'); return; }
+  toast('Building today\'s set…');
+  const today = new Date().toISOString().slice(0,10);
+  const rng = seededRng(today + 'varc_daily');
+
+  // Pick 2 RC passages + VA set
+  const passages = shuffle([...BANK.rc_passages], rng).slice(0, 2);
+  dailySections = [];
+  passages.forEach((p, i) => {
+    dailySections.push({
+      id: `rc${i+1}`, label: `RC ${i+1}`, sublabel: p.source,
+      tag: `${p.questions.length}Q · 15 min`,
+      questions: p.questions.map(q => normQ(q, p.passage, p.id, p.source)),
+      done: false,
+    });
+  });
+  // VA set: 6 questions
+  const vaPool = shuffle([...BANK.va_questions], rng);
+  const vaQs = vaPool.slice(0, 6).map(q => normQ(q, null, null, q.source));
+  if (vaQs.length) {
+    dailySections.push({
+      id: 'va', label: 'Verbal Ability', sublabel: `${vaQs.length} questions`,
+      tag: `${vaQs.length}Q · 15 min`, questions: vaQs, done: false,
+    });
+  }
+  dailyData = { session_id: 'daily_' + today };
+  openDailyPicker();
+}
+
+function openDailyPicker() {
+  document.getElementById('daily-picker-date').textContent =
+    new Date().toLocaleDateString('en-IN',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
+  renderDailySectionCards(document.getElementById('daily-section-cards'));
+  document.getElementById('daily-picker').style.display = 'flex';
+}
+
+function closeDailyPicker() {
+  document.getElementById('daily-picker').style.display = 'none';
+}
+
+function renderDailySectionCards(container) {
+  container.innerHTML = dailySections.map(sec => {
+    const done = sec.done;
+    return `<div style="background:var(--bg1);border:1px solid ${done ? 'rgba(61,158,107,.3)' : 'var(--line)'};border-radius:var(--r2);padding:18px 20px;display:flex;align-items:center;justify-content:space-between;${done?'opacity:.6':'cursor:pointer'}" ${done ? '' : `onclick="launchDailySection('${sec.id}')"`}>
+      <div>
+        <div style="font-size:13px;font-weight:600;margin-bottom:2px;display:flex;align-items:center;gap:8px">
+          ${sec.label}
+          ${done ? '<span class="tag tag-green">Done</span>' : ''}
+        </div>
+        <div style="font-size:11px;color:var(--muted)">${sec.sublabel} · <span style="color:var(--faint)">${sec.tag}</span></div>
+      </div>
+      ${done
+        ? '<span style="color:var(--green);font-size:18px">✓</span>'
+        : '<button class="btn btn-gold btn-sm">Start</button>'}
+    </div>`;
+  }).join('');
+}
+
+function launchDailySection(secId) {
+  const sec = dailySections.find(s => s.id === secId);
+  if (!sec || sec.done) return;
+  closeDailyPicker();
+  launchSession({
+    questions:  sec.questions,
+    title:      `Daily · ${sec.label}`,
+    source:     sec.sublabel,
+    type:       'daily',
+    timeSecs:   15 * 60,
+    passageId:  null,
+    sessionId:  dailyData.session_id + '_' + secId,
+    _dailySecId: secId,
+  });
+}
+
+function afterDailySection(secId) {
+  // Mark section done
+  const sec = dailySections.find(s => s.id === secId);
+  if (sec) sec.done = true;
+
+  const remaining = dailySections.filter(s => !s.done);
+
+  // Inject a "next section" bar at the top of the result page
+  const headerRow = document.querySelector('#result .result-wrap > div:first-child');
+  if (!headerRow) return;
+
+  // Remove any previous daily bar
+  const old = document.getElementById('daily-next-bar');
+  if (old) old.remove();
+
+  const bar = document.createElement('div');
+  bar.id = 'daily-next-bar';
+
+  if (!remaining.length) {
+    bar.innerHTML = `<div style="background:rgba(61,158,107,.08);border:1px solid rgba(61,158,107,.25);border-radius:var(--r);padding:10px 16px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between">
+      <span style="font-size:13px;color:var(--green);font-weight:500">✓ All daily sections complete!</span>
+    </div>`;
+  } else {
+    const next = remaining[0];
+    bar.innerHTML = `<div style="background:rgba(201,150,74,.06);border:1px solid rgba(201,150,74,.2);border-radius:var(--r);padding:10px 16px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;gap:12px">
+      <div>
+        <span style="font-size:12px;color:var(--gold);font-weight:600">Daily · ${dailySections.filter(s=>s.done).length}/${dailySections.length} done</span>
+        <span style="font-size:12px;color:var(--muted);margin-left:10px">Next up: <b style="color:var(--text);font-weight:500">${next.label}</b> — ${next.sublabel}</span>
+      </div>
+      <button class="btn btn-gold btn-sm" onclick="closeResult();launchDailySection('${next.id}')">Start ${next.label} →</button>
+    </div>`;
+  }
+
+  headerRow.insertAdjacentElement('afterend', bar);
+}
+
+/* ── SECTIONAL ───────────────────────────────────────────────────── */
+async function startSectional() {
+  if (!BANK) { toast('Questions still loading…'); return; }
+  toast('Building sectional…');
+  const rng = seededRng(Math.random().toString());
+  const passages = shuffle([...BANK.rc_passages], rng).slice(0, 4);
+  const questions = [];
+  const srcSet = new Set();
+  for (const p of passages) {
+    srcSet.add(p.source.split(' ')[0]);
+    for (const q of p.questions) {
+      questions.push(normQ(q, p.passage, p.id, p.source));
+    }
+  }
+  // Add 8 VA
+  const vaPool = shuffle([...BANK.va_questions], rng);
+  for (let i = 0; i < Math.min(8, vaPool.length); i++) {
+    questions.push(normQ(vaPool[i], null, null, vaPool[i].source));
+  }
+  launchSession({
+    questions, title: 'Sectional Mock', source: [...srcSet].join(' · '),
+    type: 'sectional', timeSecs: 40 * 60, passageId: null, sessionId: uid(),
+  });
+}
+
+/* ── PRACTICE BROWSER ────────────────────────────────────────────── */
+async function loadPractice() {
+  if (!BANK) return;
+  if (allPassages.length === 0) buildPassageList();
+  renderVAGrid();
+}
+
+function buildPassageList() {
+  allPassages = BANK.rc_passages.map(p => ({
+    passage_id: p.id,
+    source: p.source,
+    snippet: (p.passage || '').slice(0, 120).replace(/\n/g, ' '),
+    question_count: p.questions.length,
+    _data: p,
+  }));
+  renderPassages('');
+}
+
+function filterBySearch(query) {
+  renderPassages(query.trim().toLowerCase());
+}
+
+function renderPassages(query) {
+  const q = (query || '').toLowerCase();
+  const list = q
+    ? allPassages.filter(p => p.snippet.toLowerCase().includes(q) || p.source.toLowerCase().includes(q))
+    : allPassages;
+  const el = document.getElementById('passage-list');
+  const cnt = document.getElementById('passage-count');
+  if (cnt) cnt.textContent = list.length === allPassages.length
+    ? `${allPassages.length} passages`
+    : `${list.length} of ${allPassages.length}`;
+  if (!list.length) { el.innerHTML = '<div class="empty">No passages match.</div>'; return; }
+  el.innerHTML = list.map(p => `
+    <div class="passage-row" onclick="openPassage('${p.passage_id}')">
+      <div class="pr-src">${p.source}</div>
+      <div class="pr-snip">${esc(p.snippet)}</div>
+      <div class="pr-meta">
+        <span class="tag tag-default">${p.question_count}Q</span>
+        <button class="btn btn-ghost btn-sm" onclick="event.stopPropagation();openPassage('${p.passage_id}')">Start</button>
+      </div>
+    </div>`).join('');
+}
+
+async function openPassage(pid) {
+  const p = BANK.rc_passages.find(x => x.id === pid);
+  if (!p) { toast('Passage not found'); return; }
+  launchSession({
+    questions: p.questions.map(q => normQ(q, p.passage, p.id, p.source)),
+    title: `RC · ${pid}`, source: p.source, type: 'practice',
+    timeSecs: p.questions.length * 3 * 60, passageId: pid, sessionId: uid(),
+  });
+}
+
+function renderVAGrid() {
+  const VA_INFO = {
+    para_jumble:     { name: 'Para Jumbles',     desc: 'Arrange 4 sentences in a coherent order.', appType: 'para_jumbles' },
+    summary:         { name: 'Para Summary',     desc: 'Choose the best summary of a paragraph.', appType: 'para_summary' },
+    odd_one_out:     { name: 'Odd Sentence Out',  desc: 'Identify the sentence that doesn\'t belong.', appType: 'sentence_out_of_context' },
+    para_completion: { name: 'Para Completion',   desc: 'Find the sentence that completes the paragraph.', appType: 'para_completion' },
+  };
+  const el = document.getElementById('va-grid');
+  const counts = {};
+  BANK.va_questions.forEach(q => { counts[q.type] = (counts[q.type]||0) + 1; });
+  el.innerHTML = Object.entries(VA_INFO).map(([k, info]) => `
+    <div class="va-card" onclick="startVA('${k}')">
+      <div class="va-count">${counts[k]||0}</div>
+      <div class="va-name">${info.name}</div>
+      <div class="va-desc">${info.desc}</div>
+      <div style="margin-top:14px"><button class="btn btn-ghost btn-sm">Practice</button></div>
+    </div>`).join('');
+}
+
+async function startVA(bankType) {
+  if (!BANK) return;
+  const pool = BANK.va_questions.filter(q => q.type === bankType);
+  const rng = seededRng(Math.random().toString());
+  const picked = shuffle(pool, rng).slice(0, 10);
+  const questions = picked.map(q => normQ(q, null, null, q.source));
+  const label = { para_jumble:'Para Jumble', summary:'Para Summary', odd_one_out:'Odd Sentence', para_completion:'Para Completion' }[bankType] || bankType;
+  launchSession({
+    questions, title: label, source: bankType, type: 'practice',
+    timeSecs: questions.length * 3 * 60, passageId: null, sessionId: uid(),
+  });
+}
+
+function switchMode(mode, el) {
+  document.querySelectorAll('.filter-pill[id^="mode-"]').forEach(p => p.classList.remove('on'));
+  el.classList.add('on');
+  document.getElementById('pane-rc').style.display = mode === 'rc' ? '' : 'none';
+  document.getElementById('pane-va').style.display = mode === 'va' ? '' : 'none';
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   SESSION ENGINE
+════════════════════════════════════════════════════════════════════ */
+function launchSession({questions, title, source, type, timeSecs, passageId, sessionId, _dailySecId}) {
+  Object.assign(S, {
+    active:true, questions, answers:{}, qTimes:{}, flagged:new Set(),
+    cur:0, secs:timeSecs, timer:null, paused:false,
+    title, source, type, passageId,
+    sessionId: sessionId || uid(),
+    startTime:Date.now(), qStart:Date.now(), totalTime:0,
+    _dailySecId: _dailySecId || null,
+    qVisitOrder:[],    // [{qid, idx, t} ...] every nav event
+    qVisitCount:{},    // {qid: N}
+    qAnswerChanges:{}, // {qid: N}
+  });
+
+  document.getElementById('sess-title').textContent = title;
+  document.getElementById('sess-src').textContent   = source;
+  document.getElementById('session').classList.add('on');
+  document.body.style.overflow = 'hidden';
+
+  buildQNav();
+  // Track the first question visit manually (goTo isn't called for Q0)
+  const firstQ = questions[0];
+  if (firstQ) {
+    S.qVisitOrder.push({ qid: firstQ.id, idx: 0, t: 0 });
+    S.qVisitCount[firstQ.id] = 1;
+  }
+  renderQuestion(0);
+  startTimer();
+}
+
+/* ── Build Q-nav dots ───────────────────────────────────────────── */
+function buildQNav() {
+  document.getElementById('qnav-dots').innerHTML =
+    S.questions.map((q,i) =>
+      `<div class="qdot ${i===0?'active':''}" id="dot-${i}" onclick="goTo(${i})">${i+1}</div>`
+    ).join('');
+}
+
+function refreshDots() {
+  S.questions.forEach((q,i) => {
+    const d = document.getElementById(`dot-${i}`);
+    if (!d) return;
+    d.className = 'qdot';
+    const a = S.answers[q.id];
+    if (a !== undefined && a !== null && a !== '') d.classList.add('answered');
+    if (S.flagged.has(q.id)) d.classList.add('flagged');
+    if (i === S.cur) d.classList.add('active');
+  });
+}
+
+/* ── Render current question ────────────────────────────────────── */
+function renderQuestion(idx) {
+  S.cur = idx;
+  const q    = S.questions[idx];
+  const tot  = S.questions.length;
+  const pass = q._passage || null;
+
+  // Build body HTML
+  let html = '';
+  if (pass) {
+    html = `<div class="rc-split">
+      <div class="passage-col">
+        <div class="passage-eyebrow">
+          <span class="passage-eyebrow-src">${q._source||'Passage'}</span>
+          <span class="passage-eyebrow-divider"></span>
+        </div>
+        <div class="passage-body">${passageHtml(pass)}</div>
+      </div>
+      <div class="q-col">${qCard(q, idx, tot)}</div>
+    </div>`;
+  } else {
+    html = `<div style="flex:1;overflow-y:auto;display:flex;justify-content:center">
+      <div class="va-single">${qCard(q, idx, tot)}</div>
+    </div>`;
+  }
+
+  document.getElementById('sess-body').innerHTML = html;
+  document.getElementById('sess-body').scrollTop = 0;
+  refreshDots();
+  updateNavBar();
+}
+
+/* Render passage text: split on double-newline → <p> tags */
+function passageHtml(text) {
+  return text
+    .split(/\n{2,}/)
+    .map(para => para.replace(/\n/g,' ').trim())
+    .filter(Boolean)
+    .map(para => `<p>${esc(para)}</p>`)
+    .join('');
+}
+
+function qCard(q, idx, tot) {
+  const TYPE_LABELS = {
+    rc:'Reading Comprehension', para_jumbles:'Para Jumble',
+    para_summary:'Para Summary', sentence_out_of_context:'Odd Sentence Out',
+    para_completion:'Para / Sentence Completion',
+  };
+
+  const saved     = S.answers[q.id];
+  const isFlagged = S.flagged.has(q.id);
+  const isFirst   = idx === 0;
+  const isLast    = idx === tot - 1;
+  const flagStyle = isFlagged
+    ? 'background:rgba(139,92,246,.12);border-color:rgba(139,92,246,.4);color:#8b5cf6'
+    : 'color:var(--faint)';
+
+  // Build the question body based on type
+  const body = buildQBody(q, saved);
+
+  return `<div class="q-card">
+    <div class="q-card-inner">
+      <div class="q-card-topbar">
+        <div class="q-type" style="margin-bottom:0">${TYPE_LABELS[q.q_type]||q.q_type} · Q.${idx+1} of ${tot}</div>
+        <button class="copy-btn" id="copy-btn-${q.id}" onclick="copyQuestion('${q.id}')">
+          <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="5" y="5" width="8" height="8" rx="1.5"/>
+            <path d="M9 5V3a1.5 1.5 0 0 0-1.5-1.5H3A1.5 1.5 0 0 0 1.5 3v4.5A1.5 1.5 0 0 0 3 9h2"/>
+          </svg>
+          Copy
+        </button>
+      </div>
+      ${body}
+    </div>
+  </div>`;
+}
+
+/* ── Question body builder — one per type ──────────────────────── */
+function buildQBody(q, saved) {
+  switch (q.q_type) {
+
+    case 'rc':
+      return buildMCQ(q.text, q.options, q.id, saved);
+
+    case 'para_summary': {
+      // Strip embedded instruction prefix — the question IS just the passage
+      const text = q.text
+        .replace(/^The passage given below is followed by[\s\S]*?essence of the passage\.\s*/i, '')
+        .replace(/^best captures[^.]+\.\s*/i, '')
+        .trim();
+      // Render as flowing paragraphs (not line-by-line with <br>)
+      return `<div class="q-instruction">Choose the option that best captures the essence of the following passage:</div>
+        <div class="q-text passage-body" style="font-size:14px;line-height:1.75">${passageHtml(text)}</div>
+        ${buildMCQOptions(q.options, q.id, saved)}`;
+    }
+
+    case 'para_completion': {
+      // Two sub-types:
+      // A) "Sentence: X  Paragraph: _(1)_..._(4)_" → answer = which blank the sentence fits
+      // B) Simple fill-blank word choice
+      const text = q.text;
+      if (/Sentence\s*:/i.test(text)) {
+        return buildParaCompletion(text, q.options, q.id, saved);
+      }
+      // Word/phrase completion
+      return `<div class="q-text">${esc(text)}</div>
+        ${buildMCQOptions(q.options, q.id, saved)}`;
+    }
+
+    case 'sentence_out_of_context':
+    case 'odd_sentence': {
+      const OOC_INSTR = 'Five sentences are given below. Four of them form a coherent paragraph. Identify the odd one out.';
+
+      // Extract inline options that may be embedded at the end of q.text
+      const oocExtracted = extractInlineOptions(q.text);
+      const oocText = oocExtracted.text;
+      const oocOpts = q.options.length ? q.options : oocExtracted.options;
+
+      // Use pre-parsed sentences[] field (new bank) or fall back to parsing text (old bank)
+      const oocSents = (q.sentences && q.sentences.length)
+        ? q.sentences.map(s => ({ lbl: s.label, txt: s.text }))
+        : splitInstructionAndSentences(oocText).sentences;
+
+      // MCQ type with letter-pair options like AD/BC
+      if (oocOpts.length && oocOpts.some(o => /^[A-D]{2}$/.test(o.trim()))) {
+        return `<div class="q-instruction">${OOC_INSTR}</div>
+          ${buildSentenceList(oocSents)}
+          ${buildMCQOptions(oocOpts, q.id, saved)}`;
+      }
+
+      // MCQ type with number options like 1/2/3/4
+      if (oocOpts.length && oocOpts.every(o => /^\d+$/.test(o.trim()))) {
+        return `<div class="q-instruction">${OOC_INSTR}</div>
+          ${buildSentenceList(oocSents)}
+          ${buildNumberedMCQ(oocOpts, q.id, saved)}`;
+      }
+
+      // MCQ with sequence options (ABCD / DCAB etc.) extracted inline
+      if (oocOpts.length) {
+        return `<div class="q-instruction">${OOC_INSTR}</div>
+          ${buildSentenceList(oocSents)}
+          ${buildMCQOptions(oocOpts, q.id, saved)}`;
+      }
+
+      // TITA — type the odd sentence number
+      return `<div class="q-instruction">${OOC_INSTR}</div>
+        ${buildSentenceList(oocSents)}
+        ${buildTITA(q.id, saved, 'Enter the sentence number, e.g. 3')}`;
+    }
+
+    case 'para_jumbles': {
+      const PJ_INSTR = 'Arrange the sentences below into a coherent paragraph. Key in the correct sequence of numbers as your answer.';
+
+      // Extract inline options that may be embedded at the end of q.text
+      // e.g. "...sentence D. A DCAB B DACB C BCDA D ABCD"
+      const pjExtracted = extractInlineOptions(q.text);
+      const pjText  = pjExtracted.text;
+      const pjOpts  = q.options.length ? q.options : pjExtracted.options;
+
+      // Use pre-parsed sentences[] field (new bank) or fall back to parsing text (old bank)
+      const pjSents = (q.sentences && q.sentences.length)
+        ? q.sentences.map(s => ({ lbl: s.label, txt: s.text }))
+        : splitInstructionAndSentences(pjText).sentences;
+
+      // MCQ — choose from BADC / CABD etc.
+      if (pjOpts.length) {
+        return `<div class="q-instruction">${PJ_INSTR}</div>
+          ${buildSentenceList(pjSents)}
+          ${buildMCQOptions(pjOpts, q.id, saved)}`;
+      }
+
+      // TITA — type the order
+      return `<div class="q-instruction">${PJ_INSTR}</div>
+        ${buildSentenceList(pjSents)}
+        ${buildTITA(q.id, saved, 'Enter the correct order, e.g. 2143')}`;
+    }
+
+    default:
+      return `<div class="q-text">${esc(q.text)}</div>
+        ${q.format === 'TITA' ? buildTITA(q.id, saved, 'Type your answer') : buildMCQOptions(q.options, q.id, saved)}`;
+  }
+}
+
+/* ── Extract trailing inline MCQ options from question text ───── */
+// Handles patterns like: "...sentence D. A DCAB B DACB C BCDA D ABCD"
+// or "...sentence. A) DCAB  B) DACB  C) BCDA  D) ABCD"
+function extractInlineOptions(text) {
+  if (!text) return { text, options: [] };
+
+  // Pattern: trailing "A <val> B <val> C <val> D <val>" where values are word-sequences
+  // Each option value runs until the next letter label or end of string
+  // Supports "A DCAB B DACB..." and "A) DCAB B) DACB..."
+  const trailingOptRe = /\s+A[.)]\s*([^\sA-D][^\n]*?)\s+B[.)]\s*([^\sA-D][^\n]*?)\s+C[.)]\s*([^\sA-D][^\n]*?)\s+D[.)]\s*([^\sA-D][^\n]*?)\s*$/i;
+  let m = text.match(trailingOptRe);
+  if (m) {
+    return {
+      text: text.slice(0, m.index).trim(),
+      options: [m[1].trim(), m[2].trim(), m[3].trim(), m[4].trim()],
+    };
+  }
+
+  // Looser pattern without punctuation: "A DCAB B DACB C BCDA D ABCD" at end
+  // The option values are short (no spaces) — sequence codes like DCAB, 1324 etc.
+  const looseRe = /\s+A\s+(\S+)\s+B\s+(\S+)\s+C\s+(\S+)\s+D\s+(\S+)\s*$/i;
+  m = text.match(looseRe);
+  if (m) {
+    return {
+      text: text.slice(0, m.index).trim(),
+      options: [m[1], m[2], m[3], m[4]],
+    };
+  }
+
+  return { text, options: [] };
+}
+
+/* ── Parse instruction + numbered/lettered sentences ──────────── */
+function splitInstructionAndSentences(text) {
+  // Normalise sentence markers to "N. " — but ONLY at sentence-start positions,
+  // not inside prose like "(labelled 1, 2, 3, 4) below".
+  let norm = text.replace(/\xa0/g, ' ');
+  norm = norm.replace(/(\d+)\s+\.\s*/g, '$1. ');           // "1 . text" → "1. "
+  norm = norm.replace(/(\d+)\.(?=[^\s\d])/g, '$1. ');      // "1.NoSpace" → "1. "
+  // (N) / N) only after sentence boundaries, not inside parenthetical lists
+  norm = norm.replace(/((?:^|\n|[.?!]\s)\s*)\((\d+)\)\s+/g, '$1$2. ');
+  norm = norm.replace(/((?:^|\n|[.?!]\s)\s*)(\d+)\)\s+/g,    '$1$2. ');
+  norm = norm.replace(/[ \t]{2,}/g, ' ');
+
+  // Helper: split a string on inline "N. " / "A. " boundaries
+  const inlineSplit = (str) => {
+    const parts = str.split(/(?<![A-F\d])([A-F]|\d+)\.\s+/);
+    const out   = [];
+    for (let i = 1; i < parts.length - 1; i += 2) {
+      const txt = (parts[i + 1] || '').trim();
+      if (txt.length >= 12) out.push({ lbl: parts[i], txt });
+    }
+    return out;
+  };
+
+  const lines      = norm.split('\n').map(l => l.trim()).filter(Boolean);
+  const sentenceRe = /^([A-F]|\d+)\.\s+(.+)/;
+  let   sentences  = [];
+  const instrLines = [];
+
+  for (const line of lines) {
+    const m = line.match(sentenceRe);
+    if (m) {
+      const sub = inlineSplit(line);
+      sentences.push(...(sub.length > 1 ? sub : [{ lbl: m[1], txt: m[2].trim() }]));
+    } else if (!sentences.length) {
+      // Instruction candidate — but check if it hides inline sentences
+      const sub = inlineSplit(line);
+      if (sub.length >= 2) {
+        sentences.push(...sub);
+        // Instruction is everything before the first sentence marker in THIS line
+        const firstM = line.search(/(?<![A-F\d])([A-F]|\d+)\.\s/);
+        if (firstM > 0) instrLines.push(line.slice(0, firstM).trim());
+      } else {
+        instrLines.push(line);
+      }
+    }
+  }
+
+  // Full inline pass if line-based found nothing
+  if (!sentences.length) {
+    const full      = lines.join(' ');
+    const firstSent = full.search(/(?<![A-F\d])\b1\.\s/);
+    const instruction = firstSent > 0 ? full.slice(0, firstSent).trim() : '';
+    const sentPart    = firstSent >= 0 ? full.slice(firstSent) : full;
+    sentences = inlineSplit(sentPart);
+    return { instruction, sentences };
+  }
+
+  // Extract instruction from before first sentence marker if instrLines is empty
+  let instruction = instrLines.join(' ').trim();
+  if (!instruction && sentences.length) {
+    const full    = lines.join(' ');
+    const firstM  = full.search(/(?<![A-F\d])([A-F]|\d+)\.\s/);
+    if (firstM > 0) instruction = full.slice(0, firstM).trim();
+  }
+
+  return { instruction, sentences };
+}
+
+function buildSentenceList(sentences) {
+  if (!sentences.length) return '';
+  return `<div class="sent-list">${sentences.map(s =>
+    `<div class="sent-item">
+      <div class="sent-lbl">${esc(s.lbl)}.</div>
+      <div>${esc(s.txt)}</div>
+    </div>`
+  ).join('')}</div>`;
+}
+
+function buildMCQ(text, options, qid, saved) {
+  return `<div class="q-text">${esc(text)}</div>${buildMCQOptions(options, qid, saved)}`;
+}
+
+function buildMCQOptions(options, qid, saved) {
+  if (!options?.length) return '';
+  return `<div class="options">${options.map((o, i) =>
+    `<div class="opt ${saved===i?'picked':''}" id="opt-${i}" onclick="pickOpt('${qid}',${i})">
+      <div class="opt-n">${i+1}</div>
+      <div>${esc(o)}</div>
+    </div>`
+  ).join('')}</div>`;
+}
+
+function buildNumberedMCQ(options, qid, saved) {
+  return `<div style="margin-top:6px;margin-bottom:4px;font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:1px;font-weight:600">Which sentence is the odd one out?</div>
+    <div class="options">${options.map((o, i) => {
+    return `<div class="opt ${saved===i?'picked':''}" id="opt-${i}" onclick="pickOpt('${qid}',${i})">
+      <div class="opt-n">${o}</div>
+      <div style="color:var(--muted)">Sentence ${o}</div>
+    </div>`;
+  }).join('')}</div>`;
+}
+
+function buildTITA(qid, saved, hint) {
+  return `<div class="tita-wrap">
+    <input class="tita-input" id="tita-inp" type="text" placeholder="${esc(hint)}"
+           value="${esc(saved||'')}" oninput="setAns('${qid}',this.value)" autocomplete="off">
+    <div class="tita-hint">TITA — type your answer · no negative marks</div>
+  </div>`;
+}
+
+function buildParaCompletion(text, options, qid, saved) {
+  // Normalise blanks — multiple formats: _ (1) _, ___1___, _____1_____
+  const normalisedText = text
+    .replace(/_+\s*\((\d+)\)\s*_+/g, '___$1___')   // _ (1) _ → ___1___
+    .replace(/_+(\d+)_+/g, '___$1___');              // _____1_____ → ___1___
+
+  // Extract instruction (before first Sentence/Statement keyword)
+  const keywordRe = /(?:Sentence|Statement)\s*:/i;
+  const kwMatch   = normalisedText.match(keywordRe);
+  const instruction = kwMatch && kwMatch.index > 10
+    ? normalisedText.slice(0, kwMatch.index).trim()
+    : '';
+
+  // Extract the GIVEN sentence — everything from "Sentence: " until:
+  //   a) "\n" or "Paragraph:" (standard format), OR
+  //   b) The NEXT "Sentence: ___" or blank marker (no-Paragraph-label format)
+  let sentText  = '';
+  let paraText  = '';
+
+  if (kwMatch) {
+    const afterKeyword = normalisedText.slice(kwMatch.index + kwMatch[0].length);
+    // Try standard format: sentence ends at \n or "Paragraph:"
+    const endStandard = afterKeyword.search(/\n|Paragraph\s*:/i);
+    if (endStandard > 0) {
+      sentText = afterKeyword.slice(0, endStandard).trim();
+      const paraMatch = normalisedText.match(/Paragraph\s*:([\s\S]*)/i);
+      paraText = paraMatch ? paraMatch[1].trim() : '';
+    } else {
+      // No-Paragraph-label format: sentence is a quoted string or text before next "Sentence: ___" or blank
+      const endAlt = afterKeyword.search(/(?:Sentence\s*:?\s*)?___\d+___|_{3,}\d+_{3,}/i);
+      if (endAlt > 0) {
+        sentText = afterKeyword.slice(0, endAlt).trim().replace(/^["']|["']$/g, '').trim();
+        paraText = afterKeyword.slice(endAlt).trim();
+      } else {
+        // Fallback: take everything after keyword as the sentence
+        sentText = afterKeyword.trim();
+        paraText = '';
+      }
+    }
+  }
+
+  // Render blank markers as visual pills; strip residual "Sentence:" prefix in para
+  const renderedPara = paraText
+    .replace(/^Sentence\s*:?\s*/i, '')
+    .replace(/___(\d+)___/g, ' <span class="blank-marker">($1)</span> ')
+    .replace(/\s{2,}/g, ' ');
+
+  return `${instruction ? `<div class="q-instruction">${esc(instruction)}</div>` : ''}
+    <div class="pc-sentence-lbl">Given sentence</div>
+    <div class="pc-sentence">${esc(sentText) || '<span style="color:var(--faint);font-style:italic">See paragraph below</span>'}</div>
+    <div class="pc-sentence-lbl" style="margin-top:10px">Paragraph — choose which blank the sentence fits</div>
+    <div class="pc-para">${renderedPara}</div>
+    ${buildMCQOptions(options, qid, saved)}`;
+}
+
+/* ── Answer ──────────────────────────────────────────────────────── */
+/* ── Fixed nav bar update ────────────────────────────────────────── */
+function updateNavBar() {
+  if (!S.active || !S.questions.length) return;
+  const q        = S.questions[S.cur];
+  const isFirst  = S.cur === 0;
+  const isLast   = S.cur === S.questions.length - 1;
+  const isFlagged = S.flagged.has(q.id);
+  const hasAns   = S.answers[q.id] !== undefined && S.answers[q.id] !== null && S.answers[q.id] !== '';
+
+  const prevBtn = document.getElementById('qnav-prev');
+  const nextBtn = document.getElementById('qnav-next');
+  const flagBtn = document.getElementById('qnav-flag');
+  const clrBtn  = document.getElementById('qnav-clear');
+
+  if (prevBtn) prevBtn.disabled = isFirst;
+
+  if (nextBtn) {
+    if (isLast) {
+      nextBtn.textContent = 'Review & Submit';
+      nextBtn.onclick     = openReviewPanel;
+    } else {
+      nextBtn.textContent = 'Next →';
+      nextBtn.onclick     = next;
+    }
+  }
+
+  if (flagBtn) {
+    flagBtn.textContent = isFlagged ? '⚑ Flagged' : '⚐ Flag';
+    flagBtn.style.cssText = isFlagged
+      ? 'background:rgba(139,92,246,.12);border-color:rgba(139,92,246,.4);color:#8b5cf6'
+      : 'color:var(--faint)';
+  }
+
+  if (clrBtn) clrBtn.style.opacity = hasAns ? '1' : '0.4';
+}
+
+/* ── Answer ──────────────────────────────────────────────────────── */
+function pickOpt(qid, idx) {
+  if (S.answers[qid] !== undefined && S.answers[qid] !== idx) {
+    S.qAnswerChanges[qid] = (S.qAnswerChanges[qid] || 0) + 1;
+  }
+  S.answers[qid] = idx;
+  document.querySelectorAll('.opt').forEach((o,i) => {
+    o.classList.toggle('picked', i === idx);
+  });
+  refreshDots();
+  updateNavBar();
+}
+function setAns(qid, val) {
+  if (S.answers[qid] !== undefined && S.answers[qid] !== val) {
+    S.qAnswerChanges[qid] = (S.qAnswerChanges[qid] || 0) + 1;
+  }
+  S.answers[qid] = val;
+  refreshDots();
+  updateNavBar();
+}
+function clearAns(qid) {
+  delete S.answers[qid];
+  document.querySelectorAll('.opt').forEach(o => o.classList.remove('picked'));
+  const inp = document.getElementById('tita-inp');
+  if (inp) inp.value = '';
+  refreshDots();
+  updateNavBar();
+}
+function toggleFlag(qid) {
+  if (S.flagged.has(qid)) S.flagged.delete(qid);
+  else S.flagged.add(qid);
+  refreshDots();
+  updateNavBar();   // updates flag button in place — no full re-render needed
+}
+function flagCurrent()  { toggleFlag(S.questions[S.cur]?.id); }
+function clearCurrent() { clearAns(S.questions[S.cur]?.id); }
+function next() { recordTime(); const n=S.cur; if(n<S.questions.length-1) goTo(n+1); }
+function prev() { recordTime(); if(S.cur>0) goTo(S.cur-1); }
+function goTo(idx) {
+  recordTime();
+  const q = S.questions[idx];
+  if (q) {
+    S.qVisitOrder.push({ qid: q.id, idx, t: Math.round((Date.now() - S.startTime) / 1000) });
+    S.qVisitCount[q.id] = (S.qVisitCount[q.id] || 0) + 1;
+  }
+  renderQuestion(idx);
+}
+function recordTime() {
+  const q = S.questions[S.cur];
+  if (!q || !S.qStart) return;
+  const e = Math.round((Date.now() - S.qStart) / 1000);
+  S.qTimes[q.id] = (S.qTimes[q.id]||0) + e;
+  S.qStart = Date.now();
+}
+
+/* ── Review & Submit panel ───────────────────────────────────────── */
+function openReviewPanel() {
+  recordTime();
+  const answered  = S.questions.filter(q => S.answers[q.id] !== undefined && S.answers[q.id] !== null && S.answers[q.id] !== '').length;
+  const flagged   = S.flagged.size;
+  const unanswered = S.questions.length - answered;
+
+  document.getElementById('rsumm').innerHTML = `
+    <div class="rsumm-cell">
+      <div class="rsumm-n" style="color:var(--green)">${answered}</div>
+      <div class="rsumm-l">Answered</div>
+    </div>
+    <div class="rsumm-cell">
+      <div class="rsumm-n" style="color:#8b5cf6">${flagged}</div>
+      <div class="rsumm-l">Flagged</div>
+    </div>
+    <div class="rsumm-cell">
+      <div class="rsumm-n" style="color:var(--muted)">${unanswered}</div>
+      <div class="rsumm-l">Unanswered</div>
+    </div>`;
+
+  document.getElementById('rqdots').innerHTML = S.questions.map((q,i) => {
+    const isAns  = S.answers[q.id] !== undefined && S.answers[q.id] !== null && S.answers[q.id] !== '';
+    const isFlag = S.flagged.has(q.id);
+    const cls    = isFlag ? 'flag' : isAns ? 'ans' : '';
+    return `<div class="rqdot ${cls}" onclick="jumpFromReview(${i})" title="Q.${i+1}">${i+1}</div>`;
+  }).join('');
+
+  document.getElementById('review-panel').classList.add('on');
+}
+function jumpFromReview(idx) {
+  closeReviewPanel();
+  goTo(idx);
+}
+function closeReviewPanel() {
+  document.getElementById('review-panel').classList.remove('on');
+}
+function confirmSubmit() {
+  closeReviewPanel();
+  submitSession();
+}
+
+/* ── Timer ────────────────────────────────────────────────────────── */
+function startTimer() {
+  clearInterval(S.timer);
+  S.timer = setInterval(() => {
+    if (S.paused) return;
+    S.secs--; S.totalTime++;
+    const m = String(Math.floor(S.secs/60)).padStart(2,'0');
+    const s = String(S.secs%60).padStart(2,'0');
+    const el = document.getElementById('sess-timer');
+    el.textContent = `${m}:${s}`;
+    el.className   = 'timer' + (S.secs < 120 ? ' warn' : '');
+    if (S.secs <= 0) { clearInterval(S.timer); toast('Time up!'); setTimeout(submitSession, 1500); }
+  }, 1000);
+}
+function togglePause() {
+  S.paused = !S.paused;
+  document.getElementById('veil').classList.toggle('on', S.paused);
+  document.getElementById('pause-btn').innerHTML = S.paused
+    ? `<svg width="11" height="11" viewBox="0 0 11 11" fill="currentColor"><polygon points="1.5,1 9.5,5.5 1.5,10"/></svg>`
+    : `<svg width="11" height="11" viewBox="0 0 11 11" fill="currentColor"><rect x=".5" y=".5" width="3.5" height="10" rx=".8"/><rect x="7" y=".5" width="3.5" height="10" rx=".8"/></svg>`;
+}
+
+/* ── Submit ───────────────────────────────────────────────────────── */
+async function submitSession() {
+  clearInterval(S.timer);
+  S.paused = false;
+  document.getElementById('veil').classList.remove('on');
+  recordTime();
+  toast('Scoring…');
+
+  // Score locally
+  const results = S.questions.map((q, i) => {
+    const userAns = S.answers[q.id];
+    const isSkipped = userAns === undefined || userAns === null || userAns === '';
+    let isCorrect = false;
+    let correctIdx = q._correctIdx;
+    let correctVal = q._correctVal || q.answer || '';
+
+    if (!isSkipped) {
+      if (q.format === 'TITA') {
+        isCorrect = String(userAns).trim() === String(correctVal).trim();
+      } else {
+        isCorrect = parseInt(userAns) === correctIdx;
+      }
+    }
+
+    return {
+      q_type: q.q_type, text: q.text, options: q.options,
+      sentences: q.sentences, format: q.format,
+      user_answer: isSkipped ? null : userAns,
+      correct_idx: correctIdx, correct_val: correctVal,
+      is_correct: isCorrect, is_skipped: isSkipped,
+      time_secs: S.qTimes[q.id] || 0,
+      explanation: q.explanation || '',
+      full_text: q.text,
+    };
+  });
+
+  const correct = results.filter(r => r.is_correct).length;
+  const wrong = results.filter(r => !r.is_skipped && !r.is_correct).length;
+  const skipped = results.filter(r => r.is_skipped).length;
+  const score = correct * 3 - wrong;
+  const maxScore = S.questions.length * 3;
+  const attempted = correct + wrong;
+  const accuracy = attempted > 0 ? Math.round(correct / attempted * 100) : 0;
+  const avgTime = Math.round(results.reduce((s,r) => s + r.time_secs, 0) / results.length);
+
+  const r = { score, max_score: maxScore, correct, wrong, skipped, accuracy, avg_time: avgTime, results };
+
+  // Push to Supabase
+  try {
+    if (SUPA_OK()) {
+      await ensureUser();
+      const [session] = await supaPost('test_sessions', {
+        user_id: getUserId(), mode: S.type, score, max_score: maxScore,
+        total_qs: S.questions.length, correct, wrong, skipped, accuracy,
+        time_allotted_sec: S.secs + S.totalTime, time_used_sec: S.totalTime,
+        marks_wasted: wrong,
+      }) || [null];
+      if (session?.id) {
+        await supaPost('test_responses', results.map((res, i) => ({
+          session_id: session.id, question_id: S.questions[i].id,
+          question_type: TYPE_UNMAP[res.q_type] || res.q_type,
+          selected_answer: res.user_answer != null ? String(res.user_answer) : null,
+          correct_answer: String(res.correct_val), is_correct: res.is_correct,
+          is_skipped: res.is_skipped, time_spent_ms: (res.time_secs || 0) * 1000,
+        })));
+      }
+    } else {
+      // Save to localStorage as fallback
+      const sessions = JSON.parse(localStorage.getItem('varc_sessions') || '[]');
+      sessions.unshift({
+        mode: S.type, score, max_score: maxScore, total_qs: S.questions.length,
+        correct, wrong, skipped, accuracy, time_used_sec: S.totalTime,
+        marks_wasted: wrong, created_at: new Date().toISOString(), _results: results,
+      });
+      localStorage.setItem('varc_sessions', JSON.stringify(sessions.slice(0, 100)));
+    }
+  } catch(e) { console.error('Save failed:', e); }
+
+  document.getElementById('session').classList.remove('on');
+  document.body.style.overflow = '';
+  S.active = false;
+  showResult(r);
+}
+
+function exitSession() {
+  if (S.active && !confirm('Exit? Progress won\'t be saved.')) return;
+  clearInterval(S.timer);
+  S.active = false;
+  document.getElementById('session').classList.remove('on');
+  document.getElementById('veil').classList.remove('on');
+  document.body.style.overflow = '';
+}
+
+/* ── Results ──────────────────────────────────────────────────────── */
+let _resultData = []; // stored for expand modal
+
+function showResult(r) {
+  _resultData = r.results;
+  renderResultHero(r, document.getElementById('result-hero'));
+  renderInsights(r.results, S.qTimes);
+  renderReviewList(r.results);
+
+  document.getElementById('result').classList.add('on');
+
+  // Render attempt timeline using live S state (before it gets reset)
+  renderTimeline(S.questions, S.qTimes, S.qVisitCount, S.qAnswerChanges, S.qVisitOrder, r.results);
+
+  // If this was a daily section, mark it done and update the result header
+  if (S._dailySecId) {
+    afterDailySection(S._dailySecId);
+  }
+}
+
+function renderTimeline(questions, qTimes, qVisitCount, qAnswerChanges, visitOrder, results) {
+  const el = document.getElementById('attempt-timeline');
+  if (!el) return;
+
+  const maxTime = Math.max(...questions.map(q => qTimes[q.id] || 0), 1);
+
+  // Build visit-order map: first visit number per question
+  const firstVisit = {};
+  let visitNum = 1;
+  for (const v of visitOrder) {
+    if (!(v.qid in firstVisit)) { firstVisit[v.qid] = visitNum++; }
+  }
+
+  el.innerHTML = questions.map((q, i) => {
+    const secs      = qTimes[q.id] || 0;
+    const visits    = qVisitCount[q.id] || 1;
+    const changes   = qAnswerChanges[q.id] || 0;
+    const order     = firstVisit[q.id] || (i + 1);
+    const res       = results[i];
+    const pct       = Math.round((secs / maxTime) * 100);
+
+    // Bar colour: green correct, red wrong, grey skipped
+    const barColor  = res.is_skipped
+      ? 'var(--bg3)'
+      : res.is_correct
+        ? 'rgba(61,158,107,.55)'
+        : 'rgba(196,80,80,.55)';
+
+    const labelColor = res.is_skipped ? 'var(--faint)' : res.is_correct ? 'var(--green)' : 'var(--red)';
+
+    // Format time
+    const timeStr = secs >= 60
+      ? `${Math.floor(secs/60)}m ${secs%60}s`
+      : `${secs}s`;
+
+    // Badges
+    const badges = [];
+    if (order !== i + 1) {
+      badges.push(`<span class="tl-badge" style="background:rgba(201,150,74,.12);color:var(--gold);border:1px solid rgba(201,150,74,.2)">#${order} visited</span>`);
+    }
+    if (visits > 1) {
+      badges.push(`<span class="tl-badge" style="background:rgba(139,92,246,.1);color:#8b5cf6;border:1px solid rgba(139,92,246,.25)">↩ ${visits}x</span>`);
+    }
+    if (changes > 0) {
+      badges.push(`<span class="tl-badge" style="background:rgba(196,80,80,.1);color:var(--red);border:1px solid rgba(196,80,80,.2)">~${changes} changed</span>`);
+    }
+
+    return `<div class="tl-row">
+      <div class="tl-qn">Q${i+1}</div>
+      <div>
+        <div class="tl-bar-wrap">
+          <div class="tl-bar" style="width:${pct}%;background:${barColor}"></div>
+          <span class="tl-bar-label" style="color:${labelColor}">${timeStr}</span>
+        </div>
+        ${badges.length ? `<div class="tl-meta" style="margin-top:3px">${badges.join('')}</div>` : ''}
+      </div>
+      <div style="font-size:10px;color:var(--faint);text-align:right;font-family:'Geist Mono',monospace">${res.is_skipped?'—':res.is_correct?'✓':'✗'}</div>
+    </div>`;
+  }).join('');
+}
+
+function openHistoricResult(idx) {
+  const s = window._recentSessions?.[idx];
+  if (!s) return;
+  _resultData = s.results;
+  renderResultHero(s, document.getElementById('result-hero'), `${s.title || typeLabel(s.type) || 'Session'} · ${s.date.slice(0,10)}`);
+  renderInsights(s.results, null);
+  renderReviewList(s.results);
+
+  // Historic timeline (no live visit data, just time bars)
+  const el = document.getElementById('attempt-timeline');
+  if (el) {
+    const maxTime = Math.max(...s.results.map(r => r.time_secs || 0), 1);
+    el.innerHTML = s.results.map((res, i) => {
+      const secs = res.time_secs || 0;
+      const pct  = Math.round((secs / maxTime) * 100);
+      const barColor   = res.is_skipped ? 'var(--bg3)' : res.is_correct ? 'rgba(61,158,107,.55)' : 'rgba(196,80,80,.55)';
+      const labelColor = res.is_skipped ? 'var(--faint)' : res.is_correct ? 'var(--green)' : 'var(--red)';
+      const timeStr    = secs >= 60 ? `${Math.floor(secs/60)}m ${secs%60}s` : `${secs}s`;
+      return `<div class="tl-row">
+        <div class="tl-qn">Q${i+1}</div>
+        <div><div class="tl-bar-wrap">
+          <div class="tl-bar" style="width:${pct}%;background:${barColor}"></div>
+          <span class="tl-bar-label" style="color:${labelColor}">${timeStr}</span>
+        </div></div>
+        <div style="font-size:10px;color:var(--faint);text-align:right;font-family:'Geist Mono',monospace">${res.is_skipped?'—':res.is_correct?'✓':'✗'}</div>
+      </div>`;
+    }).join('');
+  }
+
+  document.getElementById('daily-next-bar')?.remove();
+  document.getElementById('result').classList.add('on');
+}
+
+/* ── SHARED RESULT RENDERERS ──────────────────────────────────────── */
+function renderResultHero(r, el, subtitle) {
+  const attempted     = r.correct + r.wrong;
+  const attAcc        = attempted ? Math.round(r.correct / attempted * 100) : 0;
+  const attAccColor   = attAcc >= 75 ? 'var(--green)' : attAcc >= 55 ? 'var(--gold)' : 'var(--red)';
+  const marksLost     = r.wrong;   // −1 per wrong
+  const accColor      = r.accuracy >= 70 ? 'var(--green)' : r.accuracy >= 50 ? 'var(--gold)' : 'var(--red)';
+
+  el.innerHTML = `
+    <div style="flex:1">
+      ${subtitle ? `<div style="font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--faint);margin-bottom:8px">${subtitle}</div>` : ''}
+      <div style="display:flex;align-items:baseline;gap:6px;margin-bottom:4px">
+        <div class="r-score">${r.score}<span class="r-max">/${r.max_score}</span></div>
+        <div style="font-size:11px;color:var(--faint);margin-bottom:2px">
+          <span style="color:var(--green)">+${r.correct * 3}</span>
+          <span style="color:var(--muted);margin:0 2px">/</span>
+          <span style="color:var(--red)">−${marksLost}</span>
+        </div>
+      </div>
+      <div class="r-stats">
+        <div>
+          <div class="r-sv" style="color:var(--green)">${r.correct}</div>
+          <div class="r-sl">Correct</div>
+        </div>
+        <div>
+          <div class="r-sv" style="color:var(--red)">${r.wrong}</div>
+          <div class="r-sl">Wrong</div>
+        </div>
+        <div>
+          <div class="r-sv" style="color:var(--faint)">${r.skipped}</div>
+          <div class="r-sl">Skipped</div>
+        </div>
+        <div>
+          <div class="r-sv" style="color:${attAccColor}">${attAcc}%</div>
+          <div class="r-sl">Attempted acc.</div>
+        </div>
+        <div>
+          <div class="r-sv" style="color:var(--muted)">${r.avg_time}s</div>
+          <div class="r-sl">Avg / Q</div>
+        </div>
+      </div>
+    </div>
+    <div style="text-align:right;flex-shrink:0">
+      <div style="font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--faint);margin-bottom:3px">Overall acc.</div>
+      <div class="r-acc" style="color:${accColor}">${r.accuracy.toFixed(0)}%</div>
+    </div>`;
+}
+
+function renderInsights(results, qTimes) {
+  const el = document.getElementById('result-insights');
+  if (!el) return;
+
+  // ── 1. Type breakdown ──────────────────────────────────────────────
+  const byType = {};
+  for (const res of results) {
+    const t = res.q_type || 'unknown';
+    byType[t] = byType[t] || { correct:0, wrong:0, skipped:0, totalTime:0, count:0 };
+    const d = byType[t];
+    d.count++;
+    d.totalTime += res.time_secs || 0;
+    if (res.is_skipped)      d.skipped++;
+    else if (res.is_correct) d.correct++;
+    else                     d.wrong++;
+  }
+
+  const typeRows = Object.entries(byType).map(([t, d]) => {
+    const attempted = d.correct + d.wrong;
+    const acc = attempted ? Math.round(d.correct / attempted * 100) : null;
+    const avgT = Math.round(d.totalTime / d.count);
+    const accColor = acc === null ? 'var(--faint)' : acc >= 75 ? 'var(--green)' : acc >= 50 ? 'var(--gold)' : 'var(--red)';
+    const accStr = acc === null ? '—' : acc + '%';
+    // Mini bar
+    const barW = acc === null ? 0 : acc;
+    const barCol = acc === null ? 'var(--bg3)' : acc >= 75 ? 'rgba(61,158,107,.5)' : acc >= 50 ? 'rgba(201,150,74,.5)' : 'rgba(196,80,80,.5)';
+    return `<div style="display:grid;grid-template-columns:130px 1fr 44px 44px 44px;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line)">
+      <div style="font-size:12px;font-weight:500;color:var(--text)">${typeLabel(t)}</div>
+      <div style="position:relative;height:6px;background:var(--bg3);border-radius:3px;overflow:hidden">
+        <div style="position:absolute;inset:0;width:${barW}%;background:${barCol};border-radius:3px;transition:width .4s ease"></div>
+      </div>
+      <div style="text-align:right;font-family:'Geist Mono',monospace;font-size:12px;font-weight:600;color:${accColor}">${accStr}</div>
+      <div style="text-align:right;font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint)">${avgT}s</div>
+      <div style="text-align:right;font-size:11px;color:var(--faint)">${d.correct}/${d.count}</div>
+    </div>`;
+  }).join('');
+
+  const typeHeader = `<div style="display:grid;grid-template-columns:130px 1fr 44px 44px 44px;gap:10px;padding:0 0 6px;border-bottom:1px solid var(--line2)">
+    <div style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--faint);font-weight:600">Type</div>
+    <div></div>
+    <div style="text-align:right;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--faint);font-weight:600">Acc</div>
+    <div style="text-align:right;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--faint);font-weight:600">Avg t</div>
+    <div style="text-align:right;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--faint);font-weight:600">C/Tot</div>
+  </div>`;
+
+  // ── 2. Time traps (spent long, got wrong) ──────────────────────────
+  const timeSrc = results.map(r => ({...r, _t: r.time_secs || 0}));
+  const attempted = timeSrc.filter(r => !r.is_skipped);
+  const avgTime = attempted.length
+    ? attempted.reduce((a, r) => a + r._t, 0) / attempted.length
+    : 0;
+  const trapThreshold = Math.max(avgTime * 1.5, 90);
+
+  const traps = timeSrc
+    .map((r, i) => ({...r, _i: i}))
+    .filter(r => !r.is_skipped && !r.is_correct && r._t >= trapThreshold)
+    .sort((a, b) => b._t - a._t)
+    .slice(0, 4);
+
+  // ── 3. Speed wins (correct, fast) ─────────────────────────────────
+  const speedWins = timeSrc
+    .map((r, i) => ({...r, _i: i}))
+    .filter(r => !r.is_skipped && r.is_correct && r._t <= avgTime * 0.6)
+    .sort((a, b) => a._t - b._t)
+    .slice(0, 3);
+
+  const fmtT = s => s >= 60 ? `${Math.floor(s/60)}m ${s%60}s` : `${s}s`;
+
+  const trapHTML = traps.length ? `
+    <div style="margin-bottom:20px">
+      <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--red);margin-bottom:8px;font-family:'Geist Mono',monospace">⚠ Time traps — spent long, still wrong</div>
+      ${traps.map(r => `
+        <div onclick="openQExpand(${r._i})" style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;margin-bottom:5px;background:rgba(196,80,80,.06);border:1px solid rgba(196,80,80,.15);border-radius:7px;cursor:pointer;transition:background .12s"
+          onmouseenter="this.style.background='rgba(196,80,80,.1)'" onmouseleave="this.style.background='rgba(196,80,80,.06)'">
+          <div style="font-size:12px;color:var(--text)">Q.${r._i+1} · <span style="color:var(--muted)">${typeLabel(r.q_type)}</span></div>
+          <div style="font-family:'Geist Mono',monospace;font-size:12px;color:var(--red);font-weight:600">${fmtT(r._t)}</div>
+        </div>`).join('')}
+    </div>` : '';
+
+  const speedHTML = speedWins.length ? `
+    <div style="margin-bottom:20px">
+      <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--green);margin-bottom:8px;font-family:'Geist Mono',monospace">✓ Speed wins — correct and fast</div>
+      ${speedWins.map(r => `
+        <div onclick="openQExpand(${r._i})" style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;margin-bottom:5px;background:rgba(61,158,107,.06);border:1px solid rgba(61,158,107,.15);border-radius:7px;cursor:pointer;transition:background .12s"
+          onmouseenter="this.style.background='rgba(61,158,107,.1)'" onmouseleave="this.style.background='rgba(61,158,107,.06)'">
+          <div style="font-size:12px;color:var(--text)">Q.${r._i+1} · <span style="color:var(--muted)">${typeLabel(r.q_type)}</span></div>
+          <div style="font-family:'Geist Mono',monospace;font-size:12px;color:var(--green);font-weight:600">${fmtT(r._t)}</div>
+        </div>`).join('')}
+    </div>` : '';
+
+  // ── 4. Skip quality note ───────────────────────────────────────────
+  const skipped = results.filter(r => r.is_skipped);
+  let skipNote = '';
+  if (skipped.length) {
+    // We can't know counterfactual, but we can note the count and proportion
+    const skipPct = Math.round(skipped.length / results.length * 100);
+    const wouldLose = skipped.length; // max exposure if all attempted and all wrong
+    skipNote = `<div style="padding:10px 14px;background:var(--bg2);border:1px solid var(--line);border-radius:8px;font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:20px">
+      <span style="color:var(--text);font-weight:500">Skip strategy:</span>
+      You skipped ${skipped.length} of ${results.length} questions (${skipPct}%).
+      Good skipping protects up to <span style="color:var(--gold);font-weight:600">−${wouldLose}</span> marks.
+      If your attempted accuracy is above 60%, skipping less could help.
+    </div>`;
+  }
+
+  el.innerHTML = `
+    <div style="background:var(--bg1);border:1px solid var(--line);border-radius:var(--r2);padding:18px 20px;margin-bottom:12px">
+      <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--faint);margin-bottom:12px;font-family:'Geist Mono',monospace">Performance by type</div>
+      ${typeHeader}${typeRows}
+    </div>
+    ${trapHTML || speedHTML || skipNote ? `<div style="background:var(--bg1);border:1px solid var(--line);border-radius:var(--r2);padding:18px 20px">
+      ${trapHTML}${speedHTML}${skipNote}
+    </div>` : ''}`;
+}
+
+function renderReviewList(results) {
+  document.getElementById('review-list').innerHTML = results.map((res, i) => {
+    const cls  = res.is_skipped ? '' : res.is_correct ? 'c' : 'w';
+    const mark = res.is_skipped
+      ? `<span class="tag tag-default">skipped</span>`
+      : res.is_correct
+        ? `<span class="tag tag-green">correct</span>`
+        : `<span class="tag tag-red">wrong</span>`;
+
+    let ansLine = '';
+    if (!res.is_skipped) {
+      if (res.format === 'TITA') {
+        ansLine = `<span style="color:${res.is_correct?'var(--green)':'var(--red)'}">Your: ${res.user_answer}</span>
+          ${!res.is_correct?`<span style="color:var(--green);font-weight:500">Correct: ${res.correct_val}</span>`:''}`;
+      } else {
+        const uOpt = res.options?.[res.user_answer] || '';
+        const cOpt = res.options?.[res.correct_idx] || res.correct_val || '';
+        ansLine = `<span style="color:${res.is_correct?'var(--green)':'var(--red)'}">Your: ${uOpt.slice(0,60)||res.user_answer}</span>
+          ${!res.is_correct?`<span style="color:var(--green);font-weight:500">Correct: ${cOpt.slice(0,60)}</span>`:''}`;
+      }
+    } else {
+      ansLine = `<span style="color:var(--faint)">Not attempted</span>
+        <span style="color:var(--green)">Correct: ${(res.options?.[res.correct_idx]||res.correct_val||'').slice(0,60)}</span>`;
+    }
+
+    let previewText = res.text;
+    if (res.q_type === 'para_jumbles' || res.q_type === 'sentence_out_of_context' || res.q_type === 'odd_sentence') {
+      const sents = res.sentences || [];
+      if (sents.length) {
+        const first = sents[0];
+        previewText = `${first.label || '1'}. ${first.text || first.txt || ''}`;
+      }
+    }
+
+    return `<div class="rev-item ${cls}" onclick="openQExpand(${i})">
+      <div class="rev-top">
+        <span class="rev-qn">Q.${i+1} · ${typeLabel(res.q_type)}</span>
+        ${mark}
+      </div>
+      <div class="rev-q">${esc(previewText)}…</div>
+      <div class="rev-ans">${ansLine}</div>
+    </div>`;
+  }).join('');
+}
+
+function closeResult() {
+  document.getElementById('result').classList.remove('on');
+  // Reset daily cache when going back to home so tomorrow's set loads fresh
+  const allDone = dailySections.length && dailySections.every(s => s.done);
+  if (allDone) { dailyData = null; dailySections = []; }
+  go('home');
+}
+
+/* ── COPY TO CLIPBOARD ────────────────────────────────────────────── */
+function copyQuestion(qid) {
+  const q = S.questions.find(x => x.id === qid);
+  if (!q) return;
+
+  const lines = [];
+
+  // 1. Passage content (RC only — pull from the DOM since it's already rendered)
+  if (q.q_type === 'rc') {
+    const passageEl = document.querySelector('.passage-body');
+    if (passageEl) {
+      const passageText = passageEl.innerText.trim();
+      if (passageText) {
+        lines.push('=== PASSAGE ===');
+        lines.push(passageText);
+        lines.push('');
+      }
+    }
+  }
+
+  // 2. Question text
+  lines.push('=== QUESTION ===');
+
+  // For question types that use sentences (para_jumbles, sentence_out_of_context)
+  if (q.sentences && q.sentences.length) {
+    // Add instruction based on type
+    if (q.q_type === 'para_jumbles') {
+      lines.push('Arrange the sentences below into a coherent paragraph. Key in the correct sequence of numbers as your answer.');
+    } else if (q.q_type === 'sentence_out_of_context' || q.q_type === 'odd_sentence') {
+      lines.push('Five sentences are given below. Four of them form a coherent paragraph. Identify the odd one out.');
+    }
+    lines.push('');
+    q.sentences.forEach(s => lines.push(`${s.label}. ${s.text}`));
+  } else {
+    lines.push(q.text.trim());
+  }
+
+  // 3. Options (if any)
+  if (q.options && q.options.length) {
+    lines.push('');
+    lines.push('=== OPTIONS ===');
+    q.options.forEach((o, i) => lines.push(`${i + 1}. ${o}`));
+  }
+
+  const text = lines.join('\n');
+
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.getElementById(`copy-btn-${qid}`);
+    if (btn) {
+      btn.classList.add('copied');
+      btn.innerHTML = `<svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="2 7 5.5 10.5 12 3.5"/></svg> Copied!`;
+      setTimeout(() => {
+        btn.classList.remove('copied');
+        btn.innerHTML = `<svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="8" height="8" rx="1.5"/><path d="M9 5V3a1.5 1.5 0 0 0-1.5-1.5H3A1.5 1.5 0 0 0 1.5 3v4.5A1.5 1.5 0 0 0 3 9h2"/></svg> Copy`;
+      }, 2000);
+    }
+    toast('Question copied to clipboard');
+  }).catch(() => toast('Copy failed — check browser permissions'));
+}
+
+/* ── Question expand modal (result screen) ───────────────────────── */
+function openQExpand(idx) {
+  const res = _resultData[idx];
+  if (!res) return;
+
+  const TYPE_LABELS = {
+    rc:'Reading Comprehension', para_jumbles:'Para Jumble',
+    para_summary:'Para Summary', sentence_out_of_context:'Odd Sentence Out',
+    odd_sentence:'Odd Sentence Out', para_completion:'Para / Sentence Completion',
+  };
+
+  // Verdict badge
+  const verdict = res.is_skipped
+    ? `<span class="tag tag-default">skipped</span>`
+    : res.is_correct
+      ? `<span class="tag tag-green">correct</span>`
+      : `<span class="tag tag-red">wrong</span>`;
+
+  document.getElementById('qexpand-type').textContent =
+    `Q.${idx+1} · ${TYPE_LABELS[res.q_type] || res.q_type}`;
+  document.getElementById('qexpand-verdict').innerHTML = verdict;
+
+  // ── Body ──────────────────────────────────────────────────────────
+  let bodyHTML = '';
+
+  // Question text / sentences
+  const isPJ  = res.q_type === 'para_jumbles';
+  const isOOC = res.q_type === 'sentence_out_of_context' || res.q_type === 'odd_sentence';
+  const sents = res.sentences || [];
+
+  if ((isPJ || isOOC) && sents.length) {
+    const instr = isPJ
+      ? 'Arrange the sentences into a coherent paragraph.'
+      : 'Identify the sentence that does not belong.';
+    bodyHTML += `<div style="font-size:12px;color:var(--muted);margin-bottom:12px;padding:9px 11px;background:var(--bg2);border-radius:6px;border-left:2px solid var(--line2)">${instr}</div>`;
+    bodyHTML += `<div class="qexpand-sents">${sents.map(s =>
+      `<div class="qexpand-sent">
+        <div style="font-family:'Geist Mono',monospace;font-size:11px;font-weight:700;color:var(--gold);flex-shrink:0;margin-top:2px;min-width:16px">${esc(s.label||s.lbl||'')}.</div>
+        <div>${esc(s.text||s.txt||'')}</div>
+      </div>`
+    ).join('')}</div>`;
+  } else {
+    const fullText = res.full_text || res.text || '';
+    bodyHTML += `<div class="qexpand-qtext">${esc(fullText)}</div>`;
+  }
+
+  // Options
+  const opts = res.options || [];
+  if (opts.length) {
+    const userIdx    = res.is_skipped ? null : (res.format === 'TITA' ? null : parseInt(res.user_answer));
+    const correctIdx = res.correct_idx;
+
+    bodyHTML += `<div class="qexpand-opts">${opts.map((o, i) => {
+      let cls = '';
+      if (i === correctIdx) cls = 'correct';
+      else if (i === userIdx && !res.is_correct) cls = 'user-wrong';
+      const badge = i === correctIdx
+        ? `<span style="font-size:10px;color:var(--green);margin-left:auto;white-space:nowrap;flex-shrink:0">✓ correct</span>`
+        : (i === userIdx && !res.is_correct)
+          ? `<span style="font-size:10px;color:var(--red);margin-left:auto;white-space:nowrap;flex-shrink:0">✗ your answer</span>`
+          : '';
+      return `<div class="qexpand-opt ${cls}">
+        <div class="qexpand-opt-n">${i+1}</div>
+        <div style="flex:1">${esc(o)}</div>
+        ${badge}
+      </div>`;
+    }).join('')}</div>`;
+  } else if (res.format === 'TITA') {
+    // TITA answer display
+    const uColor = res.is_correct ? 'var(--green)' : 'var(--red)';
+    bodyHTML += `<div style="display:flex;gap:16px;margin-top:4px">
+      ${!res.is_skipped ? `<div><div style="font-size:10px;color:var(--faint);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">Your answer</div><div style="font-family:'Geist Mono',monospace;font-size:16px;color:${uColor}">${esc(String(res.user_answer||''))}</div></div>` : ''}
+      <div><div style="font-size:10px;color:var(--faint);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">Correct answer</div><div style="font-family:'Geist Mono',monospace;font-size:16px;color:var(--green)">${esc(String(res.correct_val||''))}</div></div>
+    </div>`;
+  }
+
+  // Explanation (only if present)
+  if (res.explanation && res.explanation.trim()) {
+    bodyHTML += renderExplanation(res.explanation, res.user_answer, res.correct_idx, res.is_skipped);
+  }
+
+  document.getElementById('qexpand-body').innerHTML = bodyHTML;
+  document.getElementById('qexpand-overlay').classList.add('on');
+}
+
+function renderExplanation(raw, userAnswer, correctIdx, isSkipped) {
+  // Try to parse as JSON first
+  let data = null;
+  const trimmed = raw.trim();
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try { data = JSON.parse(trimmed); } catch(e) {
+      // Try to salvage with single→double quote swap (some banks use single quotes)
+      try {
+        const fixed = trimmed
+          .replace(/'/g, '"')
+          .replace(/(\w)"(\w)/g, "$1'$2"); // restore contractions
+        data = JSON.parse(fixed);
+      } catch(e2) { /* fall through to plain text */ }
+    }
+  }
+
+  const wrap = (inner) =>
+    `<div class="qexpand-explanation">${inner}</div>`;
+
+  // ── Structured JSON explanation ──────────────────────────────────
+  if (data && typeof data === 'object' && !Array.isArray(data)) {
+    let html = '';
+
+    // HOW TO APPROACH
+    if (data.approach) {
+      html += `<div class="exp-section exp-approach">
+        <div class="exp-section-lbl">How to approach</div>
+        <div class="exp-approach-text">${esc(data.approach)}</div>
+      </div>`;
+    }
+
+    // OPTION BREAKDOWN
+    if (data.options && typeof data.options === 'object') {
+      const userIdx    = isSkipped ? null : (typeof userAnswer !== 'undefined' ? parseInt(userAnswer) : null);
+      const letterMap  = ['A','B','C','D','E'];
+
+      html += `<div class="exp-section exp-opts-section">
+        <div class="exp-section-lbl">Option breakdown</div>
+        <div>${Object.entries(data.options).map(([letter, opt]) => {
+          const optIdx    = letterMap.indexOf(letter.toUpperCase());
+          const isCorrect = (optIdx === correctIdx) ||
+                            (typeof opt === 'object' && opt.verdict && opt.verdict.toLowerCase() === 'correct');
+          const isUserWrong = !isCorrect && (optIdx === userIdx);
+
+          const letterCls = isCorrect ? 'correct' : isUserWrong ? 'user-wrong' : 'incorrect';
+          const verdictCls = isCorrect ? 'correct' : 'incorrect';
+          const verdict    = isCorrect ? '✓ Correct' : '✗ Incorrect';
+
+          const reason = typeof opt === 'object'
+            ? (opt.reason || opt.explanation || '')
+            : String(opt);
+
+          return `<div class="exp-opt-row">
+            <div class="exp-opt-letter ${letterCls}">${esc(letter.toUpperCase())}</div>
+            <div class="exp-opt-content">
+              <div class="exp-opt-verdict ${verdictCls}">${verdict}</div>
+              ${reason ? `<div class="exp-opt-reason">${esc(reason)}</div>` : ''}
+            </div>
+          </div>`;
+        }).join('')}</div>
+      </div>`;
+    }
+
+    // KEY RULE / TAKEAWAY
+    const keyText = data.key_rule || data.key_takeaway || data.takeaway || data.rule || '';
+    if (keyText) {
+      html += `<div class="exp-section exp-key-rule">
+        <div class="exp-section-lbl">Key rule</div>
+        <div class="exp-key-rule-text">${esc(keyText)}</div>
+      </div>`;
+    }
+
+    // Fallback: top-level string fields we haven't handled yet
+    if (!html) {
+      const text = Object.values(data).filter(v => typeof v === 'string').join('\n\n');
+      html = `<div class="exp-plain">${esc(text || raw)}</div>`;
+    }
+
+    return wrap(html);
+  }
+
+  // ── Plain text explanation ───────────────────────────────────────
+  // 1. Rejoin soft-wrapped lines (single \n mid-sentence) into full sentences.
+  //    A line break is "soft" if the preceding line doesn't end a sentence (no . ! ?).
+  const rejoined = trimmed
+    .split('\n')
+    .reduce((acc, line) => {
+      const prev = acc[acc.length - 1];
+      if (!prev) { acc.push(line); return acc; }
+      // If previous line ends without sentence-ending punctuation → soft wrap
+      const prevTrimmed = prev.trimEnd();
+      const endsClean = /[.!?:)\]"']$/.test(prevTrimmed);
+      if (!endsClean) {
+        acc[acc.length - 1] = prevTrimmed + ' ' + line.trimStart();
+      } else {
+        acc.push(line);
+      }
+      return acc;
+    }, [])
+    .join('\n');
+
+  // 2. Split on "Additional Explanation:" as a named section boundary.
+  const additionalMatch = rejoined.match(/^([\s\S]*?)\n?(Additional Explanation\s*:)([\s\S]*)$/i);
+
+  function renderParas(text) {
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    return lines.map(l => `<p style="margin-bottom:.7em;line-height:1.78">${esc(l)}</p>`).join('');
+  }
+
+  if (additionalMatch) {
+    const mainText = additionalMatch[1].trim();
+    const extraText = additionalMatch[3].trim();
+    const html =
+      `<div class="exp-section exp-approach" style="border-left:none">
+         <div class="exp-section-lbl" style="color:var(--blue)">Explanation</div>
+         <div style="font-size:13.5px;color:var(--text);line-height:1.8">${renderParas(mainText)}</div>
+       </div>` +
+      (extraText ? `<div class="exp-section exp-key-rule" style="border-left:none">
+         <div class="exp-section-lbl">Additional Explanation</div>
+         <div class="exp-key-rule-text" style="font-style:normal;padding:0;background:none;border:none;font-size:13.5px;line-height:1.78">${renderParas(extraText)}</div>
+       </div>` : '');
+    return wrap(html);
+  }
+
+  // 3. Generic fallback — just clean paragraphs
+  const paras = rejoined.split(/\n{2,}/).filter(Boolean);
+  const inner = paras.length > 1
+    ? paras.map(p => `<p style="margin-bottom:.85em">${esc(p.trim())}</p>`).join('')
+    : renderParas(rejoined);
+
+  return wrap(`<div class="exp-plain">${inner}</div>`);
+}
+
+function closeQExpand(e) {
+  if (e && e.target !== document.getElementById('qexpand-overlay')) return;
+  document.getElementById('qexpand-overlay').classList.remove('on');
+}
+
+/* ── UTILITIES ────────────────────────────────────────────────────── */
+function esc(s) {
+  return String(s||'')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/\n/g,'<br>');
+}
+function uid() { return Math.random().toString(36).slice(2)+Date.now().toString(36); }
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('on');
+  setTimeout(() => t.classList.remove('on'), 2400);
+}
+function typeLabel(t) {
+  return ({rc:'RC',para_jumbles:'Para Jumble',para_summary:'Para Summary',
+           sentence_out_of_context:'Odd Sentence',para_completion:'Para Completion',
+           daily:'Daily'})[t] || t;
+}
+
+/* ── ANALYTICS ────────────────────────────────────────────────────── */
+async function loadAnalytics() {
+  const el = document.getElementById('page-analytics');
+  if (!el) return;
+  
+  let sessions = [], responses = [];
+  if (SUPA_OK()) {
+    const uid = getUserId();
+    sessions = await supaGet(`test_sessions?user_id=eq.${uid}&order=created_at.desc&limit=100`);
+    responses = await supaGet(`test_responses?select=*,test_sessions!inner(user_id)&test_sessions.user_id=eq.${uid}&limit=5000`);
+  } else {
+    sessions = JSON.parse(localStorage.getItem('varc_sessions') || '[]');
+  }
+
+  if (!sessions.length) {
+    el.innerHTML = `<div class="pg-title"><b>Analytics</b></div><div class="pg-sub">Your performance dashboard</div>
+      <div class="empty" style="margin-top:40px">No test data yet. Complete some tests first!</div>`;
+    return;
+  }
+
+  const totalTests = sessions.length;
+  const totalCorrect = sessions.reduce((s,t) => s + (t.correct||0), 0);
+  const totalWrong = sessions.reduce((s,t) => s + (t.wrong||0), 0);
+  const overallAcc = totalCorrect+totalWrong > 0 ? Math.round(totalCorrect/(totalCorrect+totalWrong)*100) : 0;
+  const bestScore = Math.max(...sessions.map(s => s.score||0));
+  const avgScore = Math.round(sessions.reduce((s,t) => s + (t.score||0), 0) / totalTests);
+  const totalWasted = sessions.reduce((s,t) => s + (t.marks_wasted||0), 0);
+
+  // Streak
+  const dateSet = new Set(sessions.map(s => (s.created_at||'').slice(0,10)));
+  let streak = 0;
+  const today = new Date();
+  for (let i = 0; i < 365; i++) {
+    const d = new Date(today); d.setDate(d.getDate() - i);
+    if (dateSet.has(d.toISOString().slice(0,10))) streak++; else break;
+  }
+
+  // Type stats from responses
+  const typeStats = {};
+  responses.forEach(r => {
+    const t = r.question_type || 'unknown';
+    if (!typeStats[t]) typeStats[t] = { correct:0, total:0, timeMs:0 };
+    typeStats[t].total++;
+    if (r.is_correct) typeStats[t].correct++;
+    typeStats[t].timeMs += r.time_spent_ms || 0;
+  });
+  const typeLabelsMap = { rc:'RC', para_jumble:'Para Jumble', summary:'Summary', odd_one_out:'Odd One Out', para_completion:'Para Completion' };
+  const typesOrdered = Object.entries(typeStats).sort((a,b) => b[1].total - a[1].total);
+
+  let html = `<div class="pg-title"><b>Analytics</b></div><div class="pg-sub">Performance for ${getCurrentUser()}</div>`;
+
+  // Stats row
+  html += `<div class="stats-row" style="grid-template-columns:repeat(6,1fr);margin-bottom:20px">
+    <div class="stat"><div class="stat-v" style="color:var(--gold)">${totalTests}</div><div class="stat-l">Tests</div></div>
+    <div class="stat"><div class="stat-v" style="color:var(--green)">${overallAcc}%</div><div class="stat-l">Accuracy</div></div>
+    <div class="stat"><div class="stat-v" style="color:var(--gold)">${bestScore}</div><div class="stat-l">Best</div></div>
+    <div class="stat"><div class="stat-v">${avgScore}</div><div class="stat-l">Avg Score</div></div>
+    <div class="stat"><div class="stat-v" style="color:var(--red)">−${totalWasted}</div><div class="stat-l">Wasted</div></div>
+    <div class="stat"><div class="stat-v" style="color:${streak>0?'var(--green)':'var(--faint)'}">${streak}🔥</div><div class="stat-l">Streak</div></div>
+  </div>`;
+
+  // Score trend
+  if (sessions.length >= 2) {
+    const sorted = [...sessions].reverse();
+    const scores = sorted.map(s => s.score||0);
+    const maxS = Math.max(...scores, 1), minS = Math.min(...scores, 0);
+    const range = maxS - minS || 1;
+    html += `<div class="card" style="margin-bottom:14px"><div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--faint);margin-bottom:10px">Score Trend</div>
+      <div style="display:flex;gap:2px;align-items:flex-end;height:100px">
+      ${scores.map((s,i) => {
+        const h = Math.max(4, Math.round(((s - minS) / range) * 90));
+        const c = s >= 0 ? 'var(--gold)' : 'var(--red)';
+        const d = sorted[i].created_at?.slice(5,10)||'';
+        return `<div title="${d}: ${s}" style="flex:1;height:${h}px;background:${c};border-radius:2px 2px 0 0;min-width:4px;opacity:.7;transition:opacity .1s" onmouseenter="this.style.opacity='1'" onmouseleave="this.style.opacity='.7'"></div>`;
+      }).join('')}
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--faint);font-family:'Geist Mono',monospace;margin-top:4px">
+        <span>${sorted[0]?.created_at?.slice(5,10)||''}</span><span>${sorted[sorted.length-1]?.created_at?.slice(5,10)||''}</span>
+      </div>
+    </div>`;
+  }
+
+  // Accuracy by type
+  if (typesOrdered.length) {
+    html += `<div class="card" style="margin-bottom:14px"><div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--faint);margin-bottom:14px">Accuracy by Type</div>`;
+    for (const [t, s] of typesOrdered) {
+      const acc = s.total > 0 ? Math.round(s.correct / s.total * 100) : 0;
+      const color = acc >= 70 ? 'var(--green)' : acc >= 40 ? 'var(--gold)' : 'var(--red)';
+      html += `<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+        <div style="font-size:12px;width:110px;text-align:right;color:var(--muted);flex-shrink:0">${typeLabelsMap[t]||t}</div>
+        <div style="flex:1;height:20px;background:var(--bg2);border-radius:4px;overflow:hidden;position:relative">
+          <div style="height:100%;width:${acc}%;background:${color};border-radius:4px"></div>
+          <span style="position:absolute;right:8px;top:50%;transform:translateY(-50%);font-family:'Geist Mono',monospace;font-size:10px;font-weight:600;color:var(--text)">${acc}%</span>
+        </div>
+        <div style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint);width:40px;text-align:right">${s.correct}/${s.total}</div>
+      </div>`;
+    }
+    html += '</div>';
+  }
+
+  // Avg time per type
+  if (typesOrdered.some(([,s]) => s.timeMs > 0)) {
+    const maxAvg = Math.max(...typesOrdered.map(([,s]) => s.total > 0 ? s.timeMs/s.total : 0));
+    html += `<div class="card" style="margin-bottom:14px"><div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--faint);margin-bottom:14px">Avg Time per Question</div>`;
+    for (const [t, s] of typesOrdered) {
+      if (!s.total) continue;
+      const avg = Math.round(s.timeMs / s.total / 1000);
+      const pct = maxAvg > 0 ? Math.round((s.timeMs/s.total)/maxAvg*100) : 0;
+      const color = avg > 120 ? 'var(--red)' : avg > 60 ? 'var(--gold)' : 'var(--green)';
+      html += `<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+        <div style="font-size:12px;width:110px;text-align:right;color:var(--muted);flex-shrink:0">${typeLabelsMap[t]||t}</div>
+        <div style="flex:1;height:16px;background:var(--bg2);border-radius:3px;overflow:hidden">
+          <div style="height:100%;width:${pct}%;background:${color};border-radius:3px"></div>
+        </div>
+        <div style="font-family:'Geist Mono',monospace;font-size:11px;color:${color};width:40px">${avg}s</div>
+      </div>`;
+    }
+    html += '</div>';
+  }
+
+  // Decision quality + weakest
+  const slowWrong = responses.filter(r => !r.is_correct && !r.is_skipped && (r.time_spent_ms||0) > 90000).length;
+  const fastCorrect = responses.filter(r => r.is_correct && (r.time_spent_ms||0) < 30000).length;
+  html += `<div class="g2" style="margin-bottom:14px">
+    <div class="card"><div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--faint);margin-bottom:12px">Decision Quality</div>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <div><span class="tag tag-red">⚠ ${slowWrong}</span> <span style="font-size:12px;color:var(--muted);margin-left:6px">Slow + Wrong (&gt;90s)</span></div>
+        <div><span class="tag tag-green">✓ ${fastCorrect}</span> <span style="font-size:12px;color:var(--muted);margin-left:6px">Fast + Correct (&lt;30s)</span></div>
+        <div><span class="tag tag-red">−${totalWasted}</span> <span style="font-size:12px;color:var(--muted);margin-left:6px">Marks wasted on wrong MCQs</span></div>
+      </div>
+    </div>
+    <div class="card"><div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--faint);margin-bottom:12px">Weakest Areas</div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        ${typesOrdered.filter(([,s])=>s.total>=3).sort((a,b)=>(a[1].correct/a[1].total)-(b[1].correct/b[1].total)).slice(0,3).map(([t,s])=>{
+          const acc=Math.round(s.correct/s.total*100);
+          return `<div style="display:flex;align-items:center;gap:8px"><span class="tag tag-red">${acc}%</span><span style="font-size:13px">${typeLabelsMap[t]||t}</span><span style="font-size:11px;color:var(--faint)">(${s.total} Qs)</span></div>`;
+        }).join('')}
+      </div>
+    </div>
+  </div>`;
+
+  // 28-day streak
+  const days = ['M','T','W','T','F','S','S'];
+  html += `<div class="card" style="margin-bottom:14px"><div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--faint);margin-bottom:10px">Last 28 Days</div>
+    <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--faint);font-family:'Geist Mono',monospace;margin-bottom:4px;padding:0 2px">${['M','T','W','T','F','S','S'].map(d=>`<span style="width:28px;text-align:center">${d}</span>`).join('')}</div>
+    <div style="display:grid;grid-template-columns:repeat(7,28px);gap:3px;justify-content:start">
+    ${Array.from({length:28},(_,i)=>{
+      const d = new Date(); d.setDate(d.getDate()-(27-i));
+      const ds = d.toISOString().slice(0,10);
+      const active = dateSet.has(ds);
+      return `<div style="width:28px;height:28px;border-radius:4px;background:${active?'rgba(201,150,74,.25)':'var(--bg2)'};border:1px solid ${i===27?'var(--gold)':active?'rgba(201,150,74,.4)':'var(--line)'}" title="${ds.slice(5)}"></div>`;
+    }).join('')}
+    </div>
+  </div>`;
+
+  // Session history
+  html += `<div class="card"><div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--faint);margin-bottom:12px">Test History</div>`;
+  for (const s of sessions.slice(0,15)) {
+    const d = (s.created_at||'').slice(0,10);
+    const acc = s.accuracy != null ? Math.round(s.accuracy) : 0;
+    const sc = s.score||0;
+    html += `<div style="display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid var(--line);font-size:13px">
+      <div style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint);min-width:72px">${d}</div>
+      <div style="font-family:'Geist Mono',monospace;font-size:10px;padding:2px 6px;border-radius:3px;background:var(--bg3);color:var(--muted);border:1px solid var(--line)">${s.mode}</div>
+      <div style="font-family:'Geist Mono',monospace;font-size:14px;font-weight:500;color:${sc>=0?'var(--green)':'var(--red)'};min-width:40px">${sc>=0?'+':''}${sc}</div>
+      <div style="font-size:12px;color:var(--muted);flex:1">${s.correct||0}✓ ${s.wrong||0}✗ ${s.skipped||0}skip</div>
+      <div style="font-family:'Geist Mono',monospace;font-size:12px;font-weight:500;color:${acc>=70?'var(--green)':acc>=40?'var(--gold)':'var(--red)'}">${acc}%</div>
+    </div>`;
+  }
+  html += '</div>';
+
+  el.innerHTML = html;
+}
+
+/* ── KEYBOARD ─────────────────────────────────────────────────────── */
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    if (document.getElementById('qexpand-overlay').classList.contains('on')) {
+      document.getElementById('qexpand-overlay').classList.remove('on');
+      return;
+    }
+  }
+  if (!S.active) return;
+  if (e.key === 'p' || e.key === 'P') { togglePause(); return; }
+  if (S.paused) return;
+  if (e.key === 'ArrowRight') next();
+  if (e.key === 'ArrowLeft')  prev();
+  const q = S.questions[S.cur];
+  if (q?.options?.length && ['1','2','3','4'].includes(e.key)) pickOpt(q.id, parseInt(e.key)-1);
+});
+
+/* ── INIT ─────────────────────────────────────────────────────────── */
+async function init() {
+  toast('Loading questions…');
+  try {
+    const r = await fetch('question_bank.json');
+    BANK = await r.json();
+    const totalRc = BANK.rc_passages.reduce((s,p) => s + p.questions.length, 0);
+    const totalVa = BANK.va_questions.length;
+    document.getElementById('f-passages').textContent  = BANK.rc_passages.length;
+    document.getElementById('f-questions').textContent = totalRc + totalVa;
+    metaData = {
+      total_passages: BANK.rc_passages.length,
+      total_rc: totalRc,
+      total_va: totalVa,
+    };
+    // Hide loading spinner in practice page
+    const spinner = document.getElementById('passages-loading');
+    if (spinner) spinner.style.display = 'none';
+    toast('Ready — ' + (totalRc + totalVa) + ' questions loaded');
+  } catch(e) {
+    toast('Failed to load question bank');
+    console.error(e);
+  }
+}
+
+init();
+go('home');
+</script>
+</body>
+</html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VARC Lab</title>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@300;400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-font-smoothing:antialiased}
+:root{
+  --bg:#0d0d10;--bg1:#121217;--bg2:#1a1a21;--bg3:#22222c;
+  --line:rgba(255,255,255,.06);--line2:rgba(255,255,255,.11);
+  --text:#dedad4;--muted:#7a7880;--faint:#3e3c48;
+  --gold:#c9964a;--gold2:#e0b06a;
+  --green:#3d9e6b;--red:#c45050;--blue:#4a7fc1;
+  --r:8px;--r2:12px;
+}
+body{font-family:'Geist',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;font-size:14px;line-height:1.5}
+::-webkit-scrollbar{width:3px;height:3px}
+::-webkit-scrollbar-thumb{background:var(--bg3);border-radius:2px}
+
+/* ── SHELL ─────────────────────────────────────────────────────────── */
+.shell{display:grid;grid-template-columns:200px 1fr;min-height:100vh}
+
+/* ── SIDEBAR ───────────────────────────────────────────────────────── */
+aside{background:var(--bg1);border-right:1px solid var(--line);display:flex;flex-direction:column;position:sticky;top:0;height:100vh}
+.logo{padding:22px 18px 18px;border-bottom:1px solid var(--line)}
+.logo-name{font-family:'Instrument Serif',serif;font-size:18px;color:var(--text)}
+.logo-name em{color:var(--gold);font-style:normal}
+.logo-sub{font-size:10px;letter-spacing:1.8px;text-transform:uppercase;color:var(--faint);margin-top:2px}
+nav{padding:10px 0;flex:1}
+.nav-link{display:flex;align-items:center;gap:9px;padding:8px 18px;margin:1px 6px;border-radius:6px;color:var(--muted);cursor:pointer;transition:all .12s;font-size:13px;user-select:none}
+.nav-link:hover{color:var(--text);background:var(--bg2)}
+.nav-link.on{color:var(--text);background:var(--bg3)}
+.nav-link.on::before{content:'';display:block;width:3px;height:14px;background:var(--gold);border-radius:0 2px 2px 0;position:absolute;left:0;margin-left:-18px}
+.nav-link{position:relative}
+.nav-link svg{width:14px;height:14px;flex-shrink:0;opacity:.5}
+.nav-link:hover svg,.nav-link.on svg{opacity:1}
+.sidebar-foot{padding:14px 18px;border-top:1px solid var(--line)}
+.foot-row{display:flex;justify-content:space-between;font-size:11px;color:var(--faint);margin-top:3px}
+.foot-num{font-family:'Geist Mono',monospace;color:var(--gold);font-weight:500}
+
+/* ── MAIN ──────────────────────────────────────────────────────────── */
+main{padding:32px 36px;overflow-y:auto}
+.page{display:none}
+.page.on{display:block;animation:fi .15s ease}
+@keyframes fi{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+.pg-title{font-family:'Instrument Serif',serif;font-style:italic;font-size:26px;color:var(--text);margin-bottom:4px}
+.pg-title b{font-family:'Geist',sans-serif;font-weight:600;font-size:24px;font-style:normal}
+.pg-sub{font-size:13px;color:var(--muted);margin-bottom:28px}
+
+/* ── CARDS ─────────────────────────────────────────────────────────── */
+.card{background:var(--bg1);border:1px solid var(--line);border-radius:var(--r2);padding:20px}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.g3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+
+/* ── STATS ─────────────────────────────────────────────────────────── */
+.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
+.stat{background:var(--bg1);border:1px solid var(--line);border-radius:var(--r2);padding:16px 18px}
+.stat-v{font-family:'Geist Mono',monospace;font-size:28px;font-weight:500;color:var(--text);letter-spacing:-1px}
+.stat-l{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--faint);font-weight:600;margin-top:3px}
+
+/* ── BUTTONS ───────────────────────────────────────────────────────── */
+.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:6px;font-family:'Geist',sans-serif;font-weight:500;font-size:13px;cursor:pointer;border:none;transition:all .12s;text-decoration:none;white-space:nowrap}
+.btn-gold{background:var(--gold);color:#0d0d10}
+.btn-gold:hover{background:var(--gold2)}
+.btn-ghost{background:var(--bg3);color:var(--text);border:1px solid var(--line2)}
+.btn-ghost:hover{border-color:var(--gold);color:var(--gold)}
+.btn-sm{padding:5px 10px;font-size:12px;border-radius:5px}
+.btn-lg{padding:10px 20px;font-size:14px;border-radius:8px}
+.btn:disabled{opacity:.3;cursor:not-allowed;pointer-events:none}
+
+/* ── TAGS ──────────────────────────────────────────────────────────── */
+.tag{display:inline-block;font-size:10px;font-weight:600;padding:2px 7px;border-radius:4px;font-family:'Geist Mono',monospace;letter-spacing:.3px}
+.tag-default{background:var(--bg3);color:var(--muted);border:1px solid var(--line)}
+.tag-gold{background:rgba(201,150,74,.12);color:var(--gold);border:1px solid rgba(201,150,74,.25)}
+.tag-green{background:rgba(61,158,107,.12);color:var(--green);border:1px solid rgba(61,158,107,.25)}
+.tag-red{background:rgba(196,80,80,.12);color:var(--red);border:1px solid rgba(196,80,80,.25)}
+.tag-blue{background:rgba(74,127,193,.12);color:var(--blue);border:1px solid rgba(74,127,193,.25)}
+
+/* ── SECTION HDR ───────────────────────────────────────────────────── */
+.shd{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.shd-t{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--faint)}
+
+/* ── DASHBOARD ─────────────────────────────────────────────────────── */
+.dash-tiles{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px}
+.dash-tile{background:var(--bg1);border:1px solid var(--line);border-radius:var(--r2);padding:20px;cursor:pointer;transition:all .16s}
+.dash-tile:hover{border-color:var(--line2);background:var(--bg2)}
+.dash-tile.primary{border-color:rgba(201,150,74,.2);background:linear-gradient(135deg,var(--bg1),rgba(201,150,74,.04))}
+.dash-tile.primary:hover{border-color:rgba(201,150,74,.35)}
+.tile-eyebrow{font-size:10px;font-weight:600;letter-spacing:1.8px;text-transform:uppercase;color:var(--faint);margin-bottom:7px}
+.tile-name{font-family:'Instrument Serif',serif;font-size:19px;color:var(--text);margin-bottom:5px}
+.tile-desc{font-size:12px;color:var(--muted);line-height:1.6}
+.tile-tags{display:flex;gap:5px;margin-top:12px}
+.tile-action{margin-top:16px}
+
+/* ── PRACTICE BROWSER ──────────────────────────────────────────────── */
+.filter-row{display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap}
+.filter-pill{padding:4px 11px;border-radius:20px;border:1px solid var(--line);font-size:12px;font-weight:500;cursor:pointer;transition:all .12s;color:var(--muted);background:var(--bg1)}
+.filter-pill:hover{border-color:var(--line2);color:var(--text)}
+.filter-pill.on{border-color:var(--gold);color:var(--gold);background:rgba(201,150,74,.06)}
+
+.passage-list{display:flex;flex-direction:column;gap:8px}
+.passage-row{background:var(--bg1);border:1px solid var(--line);border-radius:var(--r);padding:14px 16px;cursor:pointer;transition:all .14s;display:flex;align-items:flex-start;gap:14px}
+.passage-row:hover{border-color:var(--line2);background:var(--bg2)}
+.pr-src{font-family:'Geist Mono',monospace;font-size:10px;color:var(--gold);font-weight:500;white-space:nowrap;margin-top:2px;min-width:70px}
+.pr-snip{font-size:13px;color:var(--muted);line-height:1.5;flex:1}
+.pr-meta{display:flex;gap:6px;align-items:center;flex-shrink:0}
+
+/* VA grid */
+.va-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}
+.va-card{background:var(--bg1);border:1px solid var(--line);border-radius:var(--r2);padding:18px;cursor:pointer;transition:all .14s}
+.va-card:hover{border-color:var(--line2);background:var(--bg2)}
+.va-count{font-family:'Geist Mono',monospace;font-size:28px;font-weight:500;color:var(--gold);letter-spacing:-1px;margin-bottom:4px}
+.va-name{font-size:13px;font-weight:500;margin-bottom:3px}
+.va-desc{font-size:11px;color:var(--muted)}
+
+/* ═══════════════════════════════════════════════════════════════════
+   PRACTICE SESSION — fullscreen overlay
+═══════════════════════════════════════════════════════════════════ */
+#session{position:fixed;inset:0;background:var(--bg);z-index:200;display:none;flex-direction:column}
+#session.on{display:flex}
+
+/* Top bar */
+.sbar{background:var(--bg1);border-bottom:1px solid var(--line);height:48px;padding:0 20px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.sbar-left{display:flex;align-items:center;gap:12px}
+.sbar-name{font-size:13px;font-weight:600}
+.sbar-src{font-family:'Geist Mono',monospace;font-size:10px;color:var(--muted);padding:2px 7px;background:var(--bg3);border-radius:4px;border:1px solid var(--line)}
+.sbar-right{display:flex;align-items:center;gap:8px}
+.timer{font-family:'Geist Mono',monospace;font-size:16px;font-weight:500;min-width:44px;text-align:center}
+.timer.warn{color:var(--red)}
+.pause-btn{width:28px;height:28px;border-radius:5px;background:var(--bg2);border:1px solid var(--line);cursor:pointer;display:flex;align-items:center;justify-content:center;color:var(--muted);transition:all .12s}
+.pause-btn:hover{border-color:var(--line2);color:var(--text)}
+
+/* Body */
+.sbody{flex:1;display:flex;overflow:hidden}
+
+/* RC layout: passage left | question right */
+.rc-split{display:grid;grid-template-columns:50% 50%;width:100%;height:100%;overflow:hidden}
+.passage-col{overflow-y:auto;padding:32px 36px;border-right:1px solid var(--line);background:var(--bg)}
+
+/* Passage header */
+.passage-eyebrow{display:flex;align-items:center;gap:8px;margin-bottom:20px}
+.passage-eyebrow-src{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--gold);font-weight:600;font-family:'Geist Mono',monospace}
+.passage-eyebrow-divider{flex:1;height:1px;background:var(--line)}
+
+/* Passage body — clean readable serif, like CAT exam */
+.passage-body{font-family:Georgia,'Times New Roman',serif;font-size:15px;line-height:1.95;color:var(--text);max-width:600px;letter-spacing:.01em}
+.passage-body p{margin-bottom:1.3em}
+.passage-body p:last-child{margin-bottom:0}
+
+/* Right question column — fills height, scrolls internally */
+.q-col{overflow-y:auto;padding:28px;display:flex;flex-direction:column;background:var(--bg1)}
+
+/* VA layout: centred single column */
+.va-single{max-width:680px;margin:0 auto;padding:32px 24px;overflow-y:auto;width:100%}
+
+/* Question card — fills available height so nav row sticks to bottom */
+.q-card{display:flex;flex-direction:column;flex:1;min-height:0}
+.q-card-inner{flex:1}
+.q-type{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--faint);font-weight:600;margin-bottom:10px}
+.q-text{font-size:14px;color:var(--text);line-height:1.7;margin-bottom:16px}
+
+/* Options */
+.options{display:flex;flex-direction:column;gap:7px}
+.opt{display:flex;align-items:flex-start;gap:10px;padding:11px 13px;border-radius:7px;border:1px solid var(--line);cursor:pointer;transition:all .11s;font-size:13px;line-height:1.5;color:var(--muted);background:var(--bg)}
+.opt:hover{border-color:var(--line2);color:var(--text)}
+.opt.picked{border-color:var(--gold);background:rgba(201,150,74,.06);color:var(--text)}
+.opt.correct{border-color:var(--green);background:rgba(61,158,107,.08);color:var(--text)}
+.opt.wrong{border-color:var(--red);background:rgba(196,80,80,.08)}
+.opt-n{width:21px;height:21px;flex-shrink:0;border-radius:4px;border:1px solid var(--line2);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;font-family:'Geist Mono',monospace;color:var(--faint);transition:all .11s}
+.opt.picked .opt-n{background:var(--gold);border-color:var(--gold);color:#0d0d10}
+.opt.correct .opt-n{background:var(--green);border-color:var(--green);color:#fff}
+.opt.wrong .opt-n{background:var(--red);border-color:var(--red);color:#fff}
+
+/* Question text */
+
+/* VA instruction line — the meta instruction before the actual content */
+.q-instruction{font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:14px;padding:10px 12px;background:var(--bg2);border-radius:6px;border-left:2px solid var(--line2)}
+
+/* Numbered sentences block (OOC, TITA PJ) */
+.sent-list{display:flex;flex-direction:column;gap:6px;margin-bottom:16px}
+.sent-item{display:flex;gap:10px;padding:10px 13px;border-radius:6px;border:1px solid var(--line);background:var(--bg);font-size:13.5px;color:var(--text);line-height:1.6}
+.sent-lbl{font-family:'Geist Mono',monospace;font-size:11px;font-weight:700;color:var(--gold);flex-shrink:0;margin-top:2px;min-width:16px}
+
+/* Para completion blank markers */
+.blank-marker{display:inline-block;background:rgba(201,150,74,.12);border:1px solid rgba(201,150,74,.3);border-radius:4px;padding:1px 8px;font-family:'Geist Mono',monospace;font-size:11px;font-weight:600;color:var(--gold);margin:0 3px;vertical-align:middle}
+
+/* Para completion sentence + paragraph layout */
+.pc-sentence{font-size:14px;color:var(--text);line-height:1.7;padding:12px 14px;background:rgba(201,150,74,.05);border:1px solid rgba(201,150,74,.2);border-radius:7px;margin-bottom:14px}
+.pc-sentence-lbl{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--gold);margin-bottom:6px;font-family:'Geist Mono',monospace}
+.pc-para{font-size:14px;color:var(--muted);line-height:1.75;margin-bottom:14px}
+
+/* TITA input */
+.tita-wrap{margin-top:4px}
+.tita-input{background:var(--bg2);border:1px solid var(--line);border-radius:6px;padding:8px 12px;font-family:'Geist Mono',monospace;font-size:15px;color:var(--text);width:140px;outline:none;transition:border-color .12s}
+.tita-input:focus{border-color:var(--gold)}
+.tita-hint{font-size:11px;color:var(--faint);margin-top:5px}
+
+/* Question card — scrollable content only, no pinned footer */
+.q-card{display:flex;flex-direction:column}
+.q-card-inner{flex:1}
+
+/* Bottom bar — single row */
+.qnav{background:var(--bg1);border-top:1px solid var(--line);padding:0 18px;display:flex;align-items:center;gap:10px;flex-shrink:0;height:46px}
+.qnav-label{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--faint);font-weight:600;white-space:nowrap}
+.qnav-dots{display:flex;gap:3px;flex-wrap:nowrap;overflow-x:auto;flex:1}
+.qdot{width:28px;height:26px;border-radius:4px;background:var(--bg2);border:1px solid var(--line);cursor:pointer;font-size:11px;font-weight:500;color:var(--faint);display:flex;align-items:center;justify-content:center;font-family:'Geist Mono',monospace;transition:all .1s;position:relative}
+.qdot:hover{border-color:var(--line2);color:var(--muted)}
+.qdot.answered{background:rgba(201,150,74,.1);border-color:rgba(201,150,74,.3);color:var(--gold)}
+.qdot.active{background:var(--gold);border-color:var(--gold);color:#0d0d10;font-weight:600}
+.qdot.flagged::after{content:'';position:absolute;top:-3px;right:-3px;width:7px;height:7px;background:#8b5cf6;border-radius:50%;border:1px solid var(--bg1)}
+.qdot.flagged{border-color:rgba(139,92,246,.35)}
+.qnav-legend{display:flex;gap:10px;font-size:10px;color:var(--faint);white-space:nowrap}
+
+/* ── REVIEW & SUBMIT PANEL ──────────────────────────────────────── */
+.review-panel{position:fixed;inset:0;z-index:600;background:rgba(13,13,16,.85);backdrop-filter:blur(12px);display:none;align-items:center;justify-content:center}
+.review-panel.on{display:flex}
+.review-box{background:var(--bg1);border:1px solid var(--line2);border-radius:14px;padding:28px;width:460px;max-width:92vw;max-height:80vh;overflow-y:auto}
+.review-box-title{font-family:'Instrument Serif',serif;font-size:20px;margin-bottom:4px}
+.review-box-sub{font-size:12px;color:var(--muted);margin-bottom:20px}
+.review-summary{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:20px}
+.rsumm-cell{background:var(--bg2);border-radius:8px;padding:12px;text-align:center}
+.rsumm-n{font-family:'Geist Mono',monospace;font-size:24px;font-weight:500;line-height:1}
+.rsumm-l{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--faint);margin-top:4px;font-weight:600}
+.review-qgrid{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:20px}
+.rqdot{width:34px;height:32px;border-radius:5px;display:flex;align-items:center;justify-content:center;font-family:'Geist Mono',monospace;font-size:11px;font-weight:600;cursor:pointer;transition:all .12s;border:1px solid var(--line);background:var(--bg2);color:var(--faint);position:relative}
+.rqdot.ans{background:rgba(61,158,107,.12);border-color:rgba(61,158,107,.3);color:var(--green)}
+.rqdot.flag{background:rgba(139,92,246,.1);border-color:rgba(139,92,246,.35);color:#8b5cf6}
+.rqdot.flag::after{content:'';position:absolute;top:-3px;right:-3px;width:7px;height:7px;background:#8b5cf6;border-radius:50%;border:1px solid var(--bg1)}
+.rqdot:hover{border-color:var(--gold);color:var(--gold)}
+.review-legend{display:flex;gap:14px;font-size:11px;color:var(--muted);margin-bottom:20px;flex-wrap:wrap}
+.rleg{display:flex;align-items:center;gap:5px}
+.rleg-sq{width:11px;height:11px;border-radius:2px;border:1px solid}
+.review-actions{display:flex;gap:8px;justify-content:flex-end}
+.veil{position:fixed;inset:0;z-index:900;background:rgba(13,13,16,.9);backdrop-filter:blur(18px) saturate(.3);display:none;align-items:center;justify-content:center}
+.veil.on{display:flex}
+.veil-box{background:var(--bg1);border:1px solid var(--line2);border-radius:14px;padding:36px 48px;text-align:center}
+.veil-t{font-family:'Instrument Serif',serif;font-style:italic;font-size:24px;margin-bottom:4px}
+.veil-s{font-size:13px;color:var(--muted);margin-bottom:20px}
+
+/* ── RESULT ─────────────────────────────────────────────────────────── */
+#result{position:fixed;inset:0;background:var(--bg);z-index:300;overflow-y:auto;display:none}
+#result.on{display:block}
+.result-wrap{max-width:760px;margin:0 auto;padding:28px 20px}
+.result-hero{background:var(--bg1);border:1px solid var(--line);border-radius:var(--r2);padding:26px;display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:20px}
+.r-score{font-family:'Geist Mono',monospace;font-size:52px;font-weight:500;letter-spacing:-2px;color:var(--gold);line-height:1}
+.r-max{font-size:16px;color:var(--faint);font-weight:400}
+.r-stats{display:flex;gap:24px;margin-top:14px}
+.r-sv{font-family:'Geist Mono',monospace;font-size:20px;font-weight:500}
+.r-sl{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--faint);margin-top:2px}
+.r-acc{font-family:'Geist Mono',monospace;font-size:42px;font-weight:500;letter-spacing:-1px}
+/* ── REVIEW EXPAND MODAL ─────────────────────────────────────────────── */
+.rev-item{background:var(--bg1);border:1px solid var(--line);border-radius:var(--r);padding:14px;margin-bottom:8px;border-left:3px solid var(--bg3);cursor:pointer;transition:background .12s}
+.rev-item:hover{background:var(--bg2)}
+.rev-item.c{border-left-color:var(--green)}
+.rev-item.w{border-left-color:var(--red)}
+
+.qexpand-overlay{position:fixed;inset:0;z-index:800;background:rgba(13,13,16,.92);backdrop-filter:blur(16px);display:none;align-items:center;justify-content:center;padding:20px}
+.qexpand-overlay.on{display:flex}
+.qexpand-box{background:var(--bg1);border:1px solid var(--line2);border-radius:16px;width:740px;max-width:96vw;max-height:90vh;overflow-y:auto;display:flex;flex-direction:column;box-shadow:0 24px 60px rgba(0,0,0,.5)}
+.qexpand-head{padding:18px 22px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;flex-shrink:0;background:var(--bg2);border-radius:16px 16px 0 0}
+.qexpand-meta{display:flex;align-items:center;gap:8px}
+.qexpand-type{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--faint);font-weight:600}
+.qexpand-body{padding:22px;flex:1}
+.qexpand-qtext{font-size:14px;color:var(--text);line-height:1.8;margin-bottom:18px}
+.qexpand-sents{display:flex;flex-direction:column;gap:6px;margin-bottom:16px}
+.qexpand-sent{display:flex;gap:10px;padding:9px 12px;border-radius:6px;border:1px solid var(--line);background:var(--bg);font-size:13px;line-height:1.6}
+.qexpand-opts{display:flex;flex-direction:column;gap:6px;margin-bottom:16px}
+.qexpand-opt{display:flex;align-items:flex-start;gap:10px;padding:10px 12px;border-radius:7px;border:1px solid var(--line);font-size:13px;color:var(--muted);background:var(--bg)}
+.qexpand-opt.correct{border-color:var(--green);background:rgba(61,158,107,.08);color:var(--text)}
+.qexpand-opt.user-wrong{border-color:var(--red);background:rgba(196,80,80,.07)}
+.qexpand-opt.user-correct{border-color:var(--green);background:rgba(61,158,107,.08);color:var(--text)}
+.qexpand-opt-n{width:21px;height:21px;flex-shrink:0;border-radius:4px;border:1px solid var(--line2);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;font-family:'Geist Mono',monospace;color:var(--faint)}
+.qexpand-opt.correct .qexpand-opt-n{background:var(--green);border-color:var(--green);color:#fff}
+.qexpand-opt.user-wrong .qexpand-opt-n{background:var(--red);border-color:var(--red);color:#fff}
+.qexpand-explanation{margin-top:20px;border-radius:10px;overflow:hidden;border:1px solid rgba(255,255,255,.09)}
+.qexpand-explanation-lbl{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--gold);font-weight:600;margin-bottom:0;font-family:'Geist Mono',monospace}
+.qexpand-explanation-text{font-size:13px;color:var(--text);line-height:1.75}
+
+/* Structured explanation blocks */
+.exp-section{padding:15px 18px}
+.exp-section+.exp-section{border-top:1px solid rgba(255,255,255,.06)}
+.exp-section-lbl{font-size:10px;text-transform:uppercase;letter-spacing:2px;font-weight:700;font-family:'Geist Mono',monospace;margin-bottom:10px}
+.exp-approach{background:rgba(74,127,193,.07);border-left:3px solid rgba(74,127,193,.45)}
+.exp-approach .exp-section-lbl{color:var(--blue)}
+.exp-approach-text{font-size:13.5px;color:var(--text);line-height:1.8}
+.exp-key-rule{background:rgba(201,150,74,.07);border-left:3px solid rgba(201,150,74,.45)}
+.exp-key-rule .exp-section-lbl{color:var(--gold)}
+.exp-key-rule-text{font-size:13.5px;color:var(--text);line-height:1.75;font-style:italic;padding:10px 14px;background:rgba(201,150,74,.05);border-radius:6px;border:1px solid rgba(201,150,74,.15)}
+.exp-opts-section{background:var(--bg)}
+.exp-opts-section .exp-section-lbl{color:var(--faint)}
+.exp-opt-row{display:flex;gap:14px;padding:12px 0;border-bottom:1px solid var(--line)}
+.exp-opt-row:last-child{border-bottom:none;padding-bottom:0}
+.exp-opt-letter{width:28px;height:28px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-family:'Geist Mono',monospace;font-size:12px;font-weight:700;flex-shrink:0;margin-top:1px}
+.exp-opt-letter.correct{background:rgba(61,158,107,.2);color:var(--green);border:1px solid rgba(61,158,107,.35)}
+.exp-opt-letter.incorrect{background:var(--bg2);color:var(--faint);border:1px solid var(--line)}
+.exp-opt-letter.user-wrong{background:rgba(196,80,80,.18);color:var(--red);border:1px solid rgba(196,80,80,.35)}
+.exp-opt-content{flex:1;min-width:0}
+.exp-opt-verdict{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px;font-family:'Geist Mono',monospace}
+.exp-opt-verdict.correct{color:var(--green)}
+.exp-opt-verdict.incorrect{color:var(--faint)}
+.exp-opt-reason{font-size:13px;color:var(--text);line-height:1.7;opacity:.8}
+.exp-plain{padding:16px 18px;background:rgba(201,150,74,.04);font-size:13.5px;color:var(--text);line-height:1.82}
+.qexpand-close{width:28px;height:28px;border-radius:5px;background:var(--bg2);border:1px solid var(--line);cursor:pointer;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:16px;flex-shrink:0;transition:all .12s;line-height:1}
+.qexpand-close:hover{border-color:var(--line2);color:var(--text)}
+.rev-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px}
+.rev-qn{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--faint);font-weight:600}
+.rev-q{font-size:13px;color:var(--text);line-height:1.5;margin-bottom:8px}
+.rev-ans{font-size:12px;display:flex;gap:12px}
+
+/* ── COPY BUTTON ─────────────────────────────────────────────────────── */
+.copy-btn{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:5px;background:var(--bg3);border:1px solid var(--line);color:var(--muted);font-size:11px;font-weight:500;cursor:pointer;transition:all .12s;font-family:'Geist',sans-serif}
+.copy-btn:hover{border-color:var(--gold);color:var(--gold)}
+.copy-btn.copied{border-color:var(--green);color:var(--green);background:rgba(61,158,107,.08)}
+.copy-btn svg{width:11px;height:11px;flex-shrink:0}
+.q-card-topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+
+/* ── MISC ───────────────────────────────────────────────────────────── */
+.spinner{width:24px;height:24px;border:2px solid var(--bg3);border-top-color:var(--gold);border-radius:50%;animation:sp .7s linear infinite;margin:32px auto}
+@keyframes sp{to{transform:rotate(360deg)}}
+.empty{text-align:center;padding:40px 20px;color:var(--faint);font-size:13px}
+.toast{position:fixed;bottom:16px;right:16px;z-index:9999;background:var(--bg3);color:var(--text);border:1px solid var(--line2);padding:9px 14px;border-radius:7px;font-size:13px;font-weight:500;transform:translateY(60px);opacity:0;transition:all .2s;pointer-events:none}
+.toast.on{transform:translateY(0);opacity:1}
+
+/* ── ATTEMPT TIMELINE ───────────────────────────────────────────────── */
+.tl-row{display:grid;grid-template-columns:38px 1fr 52px;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--line)}
+.tl-row:last-child{border-bottom:none}
+.tl-qn{font-family:'Geist Mono',monospace;font-size:11px;font-weight:600;color:var(--faint)}
+.tl-bar-wrap{position:relative;height:20px;background:var(--bg2);border-radius:4px;overflow:hidden}
+.tl-bar{height:100%;border-radius:4px;transition:width .3s ease}
+.tl-bar-label{position:absolute;right:6px;top:50%;transform:translateY(-50%);font-family:'Geist Mono',monospace;font-size:10px;font-weight:600}
+.tl-meta{display:flex;gap:4px;justify-content:flex-end;flex-wrap:wrap}
+.tl-badge{font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;font-family:'Geist Mono',monospace;white-space:nowrap}
+
+/* divider */
+.sep{height:1px;background:var(--line);margin:20px 0}
+</style>
+</head>
+<body>
+<div class="shell">
+
+<!-- ── SIDEBAR ──────────────────────────────────────────────────────── -->
+<aside>
+  <div class="logo">
+    <div class="logo-name">VARC<em> Lab</em></div>
+    <div class="logo-sub">CAT Preparation</div>
+  </div>
+  <nav>
+    <div class="nav-link on" onclick="go('home')">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M1 6l7-5 7 5v8a1 1 0 01-1 1H2a1 1 0 01-1-1z"/><path d="M6 15V9h4v6"/>
+      </svg>
+      <span>Home</span>
+    </div>
+    <div class="nav-link" onclick="go('practice')">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M3 2h10a1 1 0 011 1v10a1 1 0 01-1 1H3a1 1 0 01-1-1V3a1 1 0 011-1z"/>
+        <path d="M5 6h6M5 9h6M5 12h3"/>
+      </svg>
+      <span>Practice</span>
+    </div>
+    <div class="nav-link" onclick="go('analytics')">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M2 14h12M4 10v4M8 6v8M12 2v12"/>
+      </svg>
+      <span>Analytics</span>
+    </div>
+  </nav>
+  <div class="sidebar-foot">
+    <div class="foot-row"><span>Passages</span><span class="foot-num" id="f-passages">—</span></div>
+    <div class="foot-row"><span>Questions</span><span class="foot-num" id="f-questions">—</span></div>
+  </div>
+</aside>
+
+<!-- ── MAIN ─────────────────────────────────────────────────────────── -->
+<main>
+
+<!-- HOME ─────────────────────────────────────────────────────────── -->
+<div class="page on" id="page-home">
+  <div class="pg-title" id="home-greeting"><em>Good morning.</em></div>
+  <div class="pg-sub" id="home-date"></div>
+
+  <div class="stats-row">
+    <div class="stat"><div class="stat-v" id="st-sessions">—</div><div class="stat-l">Sessions</div></div>
+    <div class="stat"><div class="stat-v" id="st-questions">—</div><div class="stat-l">Attempted</div></div>
+    <div class="stat"><div class="stat-v" id="st-accuracy">—</div><div class="stat-l">Accuracy</div></div>
+    <div class="stat"><div class="stat-v" id="st-score">—</div><div class="stat-l">Best score</div></div>
+  </div>
+
+  <div class="dash-tiles" style="grid-template-columns:1fr 1fr 1fr">
+    <div class="dash-tile primary" onclick="startDaily()">
+      <div class="tile-eyebrow">Today</div>
+      <div class="tile-name">Daily Practice</div>
+      <div class="tile-desc">2 RC passages and a VA set. Rotates daily so you never repeat passages.</div>
+      <div class="tile-tags">
+        <span class="tag tag-gold">2 RC</span>
+        <span class="tag tag-default">1 VA</span>
+        <span class="tag tag-default">~30 min</span>
+      </div>
+      <div class="tile-action"><button class="btn btn-gold btn-sm">Start today's set</button></div>
+    </div>
+    <div class="dash-tile" style="border-color:rgba(74,127,193,.2);background:linear-gradient(135deg,var(--bg1),rgba(74,127,193,.04))" onclick="startSectional()">
+      <div class="tile-eyebrow">Full Test</div>
+      <div class="tile-name">Sectional Mock</div>
+      <div class="tile-desc">Full CAT VARC section — 4 RC passages + VA. Mixed sources for variety.</div>
+      <div class="tile-tags">
+        <span class="tag tag-blue">22 Q</span>
+        <span class="tag tag-default">40 min</span>
+        <span class="tag tag-default">CAT pattern</span>
+      </div>
+      <div class="tile-action"><button class="btn btn-ghost btn-sm" style="border-color:rgba(74,127,193,.4);color:var(--blue)">Start sectional</button></div>
+    </div>
+    <div class="dash-tile" onclick="go('practice')">
+      <div class="tile-eyebrow">Browse</div>
+      <div class="tile-name">Practice by Type</div>
+      <div class="tile-desc">Pick any passage or VA question type from the full question bank.</div>
+      <div class="tile-tags">
+        <span class="tag tag-default">441 passages</span>
+        <span class="tag tag-default">854 VA</span>
+      </div>
+      <div class="tile-action"><button class="btn btn-ghost btn-sm">Browse questions</button></div>
+    </div>
+  </div>
+
+  <!-- Recent sessions -->
+  <div class="shd"><div class="shd-t">Recent sessions</div></div>
+  <div id="recent-sessions" class="empty">No sessions yet — start with Daily Practice above.</div>
+</div>
+
+<!-- PRACTICE ─────────────────────────────────────────────────────── -->
+<div class="page" id="page-practice">
+  <div class="pg-title"><b>Practice</b></div>
+  <div class="pg-sub">Pick a passage to read and answer, or drill a VA type.</div>
+
+  <!-- Mode tabs -->
+  <div class="filter-row" style="margin-bottom:20px">
+    <div class="filter-pill on" id="mode-rc" onclick="switchMode('rc',this)">Reading Comprehension</div>
+    <div class="filter-pill" id="mode-va" onclick="switchMode('va',this)">Verbal Ability</div>
+  </div>
+
+  <!-- RC pane -->
+  <div id="pane-rc">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+      <div style="position:relative;flex:1">
+        <svg style="position:absolute;left:10px;top:50%;transform:translateY(-50%);opacity:.35;pointer-events:none" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6.5" cy="6.5" r="4.5"/><path d="M11 11l3 3"/></svg>
+        <input id="passage-search" type="text" placeholder="Search passages…" autocomplete="off"
+          style="width:100%;background:var(--bg2);border:1px solid var(--line);border-radius:6px;padding:7px 12px 7px 32px;font-family:'Geist',sans-serif;font-size:13px;color:var(--text);outline:none;transition:border-color .12s"
+          oninput="filterBySearch(this.value)"
+          onfocus="this.style.borderColor='var(--line2)'"
+          onblur="this.style.borderColor='var(--line)'">
+      </div>
+      <div id="passage-count" style="font-size:12px;color:var(--faint);white-space:nowrap;font-family:'Geist Mono',monospace"></div>
+    </div>
+    <div class="spinner" id="passages-loading"></div>
+    <div class="passage-list" id="passage-list"></div>
+  </div>
+
+  <!-- VA pane -->
+  <div id="pane-va" style="display:none">
+    <div class="va-grid" id="va-grid"></div>
+  </div>
+</div>
+
+<!-- ANALYTICS ──────────────────────────────────────────────────── -->
+<div class="page" id="page-analytics">
+  <div class="spinner"></div>
+</div>
+
+</main>
+</div>
+
+<!-- Daily Picker -->
+<div id="daily-picker" style="position:fixed;inset:0;background:var(--bg);z-index:250;display:none;flex-direction:column;align-items:center;justify-content:center;padding:32px">
+  <div style="max-width:560px;width:100%">
+    <div style="font-family:'Instrument Serif',serif;font-style:italic;font-size:26px;margin-bottom:4px">Today's Practice</div>
+    <div style="font-size:13px;color:var(--muted);margin-bottom:28px" id="daily-picker-date"></div>
+    <div style="display:flex;flex-direction:column;gap:10px" id="daily-section-cards"></div>
+    <div style="margin-top:24px;text-align:right">
+      <button class="btn btn-ghost" onclick="closeDailyPicker()">Back</button>
+    </div>
+  </div>
+</div>
+
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     SESSION OVERLAY
+═══════════════════════════════════════════════════════════════════ -->
+<div id="session">
+  <div class="sbar">
+    <div class="sbar-left">
+      <span class="sbar-name" id="sess-title">Practice</span>
+      <span class="sbar-src" id="sess-src"></span>
+    </div>
+    <div class="sbar-right">
+      <div class="timer" id="sess-timer">—:——</div>
+      <div class="pause-btn" id="pause-btn" onclick="togglePause()">
+        <svg width="11" height="11" viewBox="0 0 11 11" fill="currentColor">
+          <rect x=".5" y=".5" width="3.5" height="10" rx=".8"/>
+          <rect x="7" y=".5" width="3.5" height="10" rx=".8"/>
+        </svg>
+      </div>
+      <button class="btn btn-gold btn-sm" onclick="openReviewPanel()">Submit</button>
+      <button class="btn btn-ghost btn-sm" onclick="exitSession()">Exit</button>
+    </div>
+  </div>
+  <div class="sbody" id="sess-body"></div>
+  <div class="qnav">
+    <button class="btn btn-ghost btn-sm" id="qnav-prev" onclick="prev()">← Prev</button>
+    <span class="qnav-label" style="margin-left:4px">Q</span>
+    <div class="qnav-dots" id="qnav-dots"></div>
+    <div style="display:flex;gap:6px;flex-shrink:0">
+      <button class="btn btn-ghost btn-sm" id="qnav-flag" onclick="flagCurrent()">⚐ Flag</button>
+      <button class="btn btn-ghost btn-sm" id="qnav-clear" onclick="clearCurrent()" style="color:var(--faint)">Clear</button>
+    </div>
+    <div style="font-size:10px;color:var(--faint);white-space:nowrap;flex-shrink:0">
+      <span style="color:var(--gold)">· ans</span>
+      <span style="color:#8b5cf6"> · flag</span>
+    </div>
+    <button class="btn btn-gold btn-sm" id="qnav-next" onclick="next()" style="flex-shrink:0">Next →</button>
+  </div>
+</div>
+
+<!-- Review & Submit panel -->
+<div class="review-panel" id="review-panel">
+  <div class="review-box">
+    <div class="review-box-title">Review & Submit</div>
+    <div class="review-box-sub">Check your answers before submitting. Click any question to go back to it.</div>
+    <div class="review-summary" id="rsumm"></div>
+    <div style="font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--faint);font-weight:600;margin-bottom:8px">Questions</div>
+    <div class="review-qgrid" id="rqdots"></div>
+    <div class="review-legend">
+      <div class="rleg"><div class="rleg-sq" style="background:rgba(61,158,107,.12);border-color:rgba(61,158,107,.3)"></div> Answered</div>
+      <div class="rleg"><div class="rleg-sq" style="background:rgba(139,92,246,.1);border-color:rgba(139,92,246,.35)"></div> Flagged for review</div>
+      <div class="rleg"><div class="rleg-sq" style="background:var(--bg2);border-color:var(--line)"></div> Unanswered</div>
+    </div>
+    <div class="review-actions">
+      <button class="btn btn-ghost" onclick="closeReviewPanel()">Back to questions</button>
+      <button class="btn btn-gold" onclick="confirmSubmit()">Submit now</button>
+    </div>
+  </div>
+</div>
+
+<!-- Pause veil -->
+<div class="veil" id="veil">
+  <div class="veil-box">
+    <div class="veil-t">Paused</div>
+    <div class="veil-s">Timer stopped. Take your time.</div>
+    <button class="btn btn-gold btn-lg" onclick="togglePause()">Resume</button>
+  </div>
+</div>
+
+<!-- Result -->
+<div id="result">
+  <div class="result-wrap">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
+      <div style="font-family:'Instrument Serif',serif;font-style:italic;font-size:20px">Results</div>
+      <button class="btn btn-ghost" onclick="closeResult()">Back to home</button>
+    </div>
+    <div class="result-hero" id="result-hero"></div>
+    <div class="sep"></div>
+    <div class="shd"><div class="shd-t">Insights</div></div>
+    <div id="result-insights" style="margin-bottom:24px"></div>
+    <div class="sep"></div>
+    <div class="shd"><div class="shd-t">Attempt timeline</div></div>
+    <div id="attempt-timeline" style="margin-bottom:24px"></div>
+    <div class="sep"></div>
+    <div class="shd"><div class="shd-t">Review</div></div>
+    <div id="review-list"></div>
+  </div>
+</div>
+
+<!-- Question Expand Modal -->
+<div class="qexpand-overlay" id="qexpand-overlay" onclick="closeQExpand(event)">
+  <div class="qexpand-box" id="qexpand-box">
+    <div class="qexpand-head">
+      <div class="qexpand-meta">
+        <span class="qexpand-type" id="qexpand-type"></span>
+        <span id="qexpand-verdict"></span>
+      </div>
+      <div class="qexpand-close" onclick="closeQExpand()">✕</div>
+    </div>
+    <div class="qexpand-body" id="qexpand-body"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+/* ── CONFIG ──────────────────────────────────────────────────────── */
+// Supabase — replace with your project details
 const SUPA_URL = 'https://cjbwpiojodcqpybhhbbp.supabase.co';
 const SUPA_KEY = 'sb_publishable_IMDpzWSB3geRSx0LxpyT0w_QFH6iAa6';
 const SUPA_OK  = () => !SUPA_URL.includes('YOUR_PROJECT');
