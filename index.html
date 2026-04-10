@@ -371,6 +371,7 @@ main{padding:32px 36px;overflow-y:auto}
   <div class="sidebar-foot">
     <div class="foot-row"><span>Passages</span><span class="foot-num" id="f-passages">—</span></div>
     <div class="foot-row"><span>Questions</span><span class="foot-num" id="f-questions">—</span></div>
+    <div class="foot-row" style="margin-top:8px"><span style="cursor:pointer;color:var(--muted);font-size:10px" onclick="if(confirm('Clear all session history?')){localStorage.removeItem('varc_sessions');location.reload()}">Clear history</span></div>
   </div>
 </aside>
 
@@ -590,8 +591,8 @@ main{padding:32px 36px;overflow-y:auto}
 <script>
 /* ── CONFIG ──────────────────────────────────────────────────────── */
 // Supabase — replace with your project details
-const SUPA_URL = 'https://cjbwpiojodcqpybhhbbp.supabase.co';
-const SUPA_KEY = 'sb_publishable_IMDpzWSB3geRSx0LxpyT0w_QFH6iAa6';
+const SUPA_URL = 'https://YOUR_PROJECT.supabase.co';
+const SUPA_KEY = 'your-anon-key-here';
 const SUPA_OK  = () => !SUPA_URL.includes('YOUR_PROJECT');
 
 /* ── QUESTION BANK ──────────────────────────────────────────────── */
@@ -773,7 +774,24 @@ async function loadHome() {
   if (SUPA_OK()) {
     sessions = await supaGet(`test_sessions?user_id=eq.${getUserId()}&order=created_at.desc&limit=50`);
   } else {
-    sessions = JSON.parse(localStorage.getItem('varc_sessions') || '[]');
+    try {
+      const raw = JSON.parse(localStorage.getItem('varc_sessions') || '[]');
+      // Validate and normalize each session
+      sessions = raw.filter(s => s && typeof s === 'object' && s.total_qs > 0).map(s => ({
+        mode: s.mode || 'practice',
+        score: typeof s.score === 'number' ? s.score : 0,
+        max_score: s.max_score || (s.total_qs || 0) * 3,
+        total_qs: s.total_qs || 0,
+        correct: s.correct || 0,
+        wrong: s.wrong || 0,
+        skipped: s.skipped || 0,
+        accuracy: s.accuracy != null ? s.accuracy : (s.correct && s.correct + s.wrong > 0 ? Math.round(s.correct / (s.correct + s.wrong) * 100) : 0),
+        time_used_sec: s.time_used_sec || 0,
+        marks_wasted: s.marks_wasted || 0,
+        created_at: s.created_at || new Date().toISOString(),
+        _results: s._results || [],
+      }));
+    } catch(e) { sessions = []; }
   }
 
   const totalSessions = sessions.length;
