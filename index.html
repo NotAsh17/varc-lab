@@ -418,8 +418,8 @@ main{padding:32px 36px;overflow-y:auto}
       <div class="tile-name">Practice by Type</div>
       <div class="tile-desc">Pick any passage or VA question type from the full question bank.</div>
       <div class="tile-tags">
-        <span class="tag tag-default">441 passages</span>
-        <span class="tag tag-default">854 VA</span>
+        <span class="tag tag-default" id="tile-passages">— passages</span>
+        <span class="tag tag-default" id="tile-va">— VA</span>
       </div>
       <div class="tile-action"><button class="btn btn-ghost btn-sm">Browse questions</button></div>
     </div>
@@ -591,8 +591,8 @@ main{padding:32px 36px;overflow-y:auto}
 <script>
 /* ── CONFIG ──────────────────────────────────────────────────────── */
 // Supabase — replace with your project details
-const SUPA_URL = 'https://cjbwpiojodcqpybhhbbp.supabase.co';
-const SUPA_KEY = 'sb_publishable_IMDpzWSB3geRSx0LxpyT0w_QFH6iAa6';
+const SUPA_URL = 'https://YOUR_PROJECT.supabase.co';
+const SUPA_KEY = 'your-anon-key-here';
 const SUPA_OK  = () => !SUPA_URL.includes('YOUR_PROJECT');
 
 /* ── QUESTION BANK ──────────────────────────────────────────────── */
@@ -2418,7 +2418,10 @@ async function loadAnalytics() {
     sessions = await supaGet(`test_sessions?user_id=eq.${uid}&order=created_at.desc&limit=100`);
     responses = await supaGet(`test_responses?select=*,test_sessions!inner(user_id)&test_sessions.user_id=eq.${uid}&limit=5000`);
   } else {
-    sessions = JSON.parse(localStorage.getItem('varc_sessions') || '[]');
+    try {
+      const raw = JSON.parse(localStorage.getItem('varc_sessions') || '[]');
+      sessions = (Array.isArray(raw) ? raw : []).filter(s => s && typeof s === 'object' && s.total_qs > 0);
+    } catch(e) { sessions = []; }
   }
 
   if (!sessions.length) {
@@ -2599,6 +2602,25 @@ document.addEventListener('keydown', e => {
 });
 
 /* ── INIT ─────────────────────────────────────────────────────────── */
+// Self-healing: clean corrupt localStorage data
+try {
+  const raw = localStorage.getItem('varc_sessions');
+  if (raw) {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      localStorage.removeItem('varc_sessions');
+      console.warn('Cleared corrupt varc_sessions (not array)');
+    } else {
+      // Remove entries with missing required fields
+      const clean = parsed.filter(s => s && typeof s === 'object' && typeof s.score === 'number' && s.total_qs > 0);
+      if (clean.length !== parsed.length) {
+        localStorage.setItem('varc_sessions', JSON.stringify(clean));
+        console.warn(`Cleaned ${parsed.length - clean.length} corrupt sessions`);
+      }
+    }
+  }
+} catch(e) { localStorage.removeItem('varc_sessions'); }
+
 async function init() {
   toast('Loading questions…');
   try {
@@ -2616,6 +2638,11 @@ async function init() {
     // Hide loading spinner in practice page
     const spinner = document.getElementById('passages-loading');
     if (spinner) spinner.style.display = 'none';
+    // Update tile counts
+    const tp = document.getElementById('tile-passages');
+    const tv = document.getElementById('tile-va');
+    if (tp) tp.textContent = BANK.rc_passages.length + ' passages';
+    if (tv) tv.textContent = totalVa + ' VA';
     toast('Ready — ' + (totalRc + totalVa) + ' questions loaded');
   } catch(e) {
     toast('Failed to load question bank');
