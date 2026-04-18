@@ -179,6 +179,9 @@ main{padding:32px 36px;overflow-y:auto}
 /* VA instruction line — the meta instruction before the actual content */
 .q-instruction{font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:14px;padding:10px 12px;background:var(--bg2);border-radius:6px;border-left:2px solid var(--line2)}
 
+/* RC instruction — CAT-style direction text shown above passage */
+.rc-instruction{font-size:12px;color:var(--muted);line-height:1.55;margin-bottom:18px;padding:11px 14px;background:rgba(201,150,74,.05);border-radius:7px;border-left:2px solid rgba(201,150,74,.35);font-style:italic;max-width:600px}
+
 /* Numbered sentences block (OOC, TITA PJ) */
 .sent-list{display:flex;flex-direction:column;gap:6px;margin-bottom:16px}
 .sent-item{display:flex;gap:10px;padding:10px 13px;border-radius:6px;border:1px solid var(--line);background:var(--bg);font-size:13.5px;color:var(--text);line-height:1.6}
@@ -1153,12 +1156,26 @@ function renderQuestion(idx) {
   // Build body HTML
   let html = '';
   if (pass) {
+    // Find the range of question numbers attached to THIS passage
+    const passId = q._passId;
+    const sameIdxs = S.questions
+      .map((qq, i) => qq._passId === passId ? i + 1 : null)
+      .filter(n => n !== null);
+    const qRange = sameIdxs.length > 1
+      ? `Questions ${sameIdxs[0]}–${sameIdxs[sameIdxs.length-1]}`
+      : `Question ${sameIdxs[0] || idx+1}`;
+    const qCount = sameIdxs.length;
+    
+    const rcInstruction = `${qRange} are based on the following passage. Choose the best answer to each question.`;
+    
     html = `<div class="rc-split">
       <div class="passage-col">
         <div class="passage-eyebrow">
           <span class="passage-eyebrow-src">${q._source||'Passage'}</span>
           <span class="passage-eyebrow-divider"></span>
+          <span style="font-size:10px;color:var(--faint);font-family:'Geist Mono',monospace;text-transform:uppercase;letter-spacing:1px">${qCount}Q</span>
         </div>
+        <div class="rc-instruction">${rcInstruction}</div>
         <div class="passage-body">${passageHtml(pass)}</div>
       </div>
       <div class="q-col">${qCard(q, idx, tot)}</div>
@@ -1247,8 +1264,9 @@ function buildQBody(q, saved) {
       if (/Sentence\s*:/i.test(text)) {
         return buildParaCompletion(text, q.options, q.id, saved);
       }
-      // Word/phrase completion
-      return `<div class="q-text">${esc(text)}</div>
+      // Word/phrase completion — choose the best sentence to complete the paragraph
+      return `<div class="q-instruction">The paragraph below has a missing sentence at the end. Choose the option that best completes the paragraph.</div>
+        <div class="q-text">${esc(text)}</div>
         ${buildMCQOptions(q.options, q.id, saved)}`;
     }
 
@@ -1320,9 +1338,18 @@ function buildQBody(q, saved) {
         ${buildTITA(q.id, saved, 'Enter the correct order, e.g. 2143')}`;
     }
 
-    default:
-      return `<div class="q-text">${esc(q.text)}</div>
+    default: {
+      // Type-specific instruction for non-standard types
+      const DEFAULT_INSTR = {
+        sentence_correction: 'Identify the sentence(s) that contain errors, or choose the option that best corrects the given sentence.',
+        fill_in_blanks: 'Fill in the blank(s) with the most appropriate word or phrase from the options below.',
+        critical_reasoning: 'Read the argument below and choose the option that best answers the question.',
+      }[q.q_type];
+      
+      return `${DEFAULT_INSTR ? `<div class="q-instruction">${DEFAULT_INSTR}</div>` : ''}
+        <div class="q-text">${esc(q.text)}</div>
         ${q.format === 'TITA' ? buildTITA(q.id, saved, 'Type your answer') : buildMCQOptions(q.options, q.id, saved)}`;
+    }
   }
 }
 
