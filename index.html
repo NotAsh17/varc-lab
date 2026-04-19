@@ -3451,10 +3451,15 @@
         try {
           const supaSessions = await supaGet(`test_sessions?user_id=eq.${getUserId()}&order=created_at.desc&limit=50`);
           if (Array.isArray(supaSessions) && supaSessions.length) {
-            // Merge, dedupe by created_at
-            const existingKeys = new Set(sessions.map(s => s.created_at));
+            // Dedupe: prefer localStorage entry (has _results). Match by exact created_at
+            // or within 30s window (handles sessions saved before the timestamp-sync fix).
             for (const ss of supaSessions) {
-              if (!existingKeys.has(ss.created_at)) sessions.push({ ...ss, _results: [] });
+              const ssTime = new Date(ss.created_at).getTime();
+              const alreadyHave = sessions.some(s => {
+                const diff = Math.abs(new Date(s.created_at).getTime() - ssTime);
+                return diff < 30000; // within 30 seconds = same session
+              });
+              if (!alreadyHave) sessions.push({ ...ss, _results: [] });
             }
             sessions.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
           }
@@ -4512,12 +4517,13 @@
       const r = { score, max_score: maxScore, correct, wrong, skipped, accuracy, avg_time: avgTime, results };
 
       // ALWAYS save to localStorage first (primary storage)
+      const _sessionCreatedAt = new Date().toISOString();
       try {
         const sessions = JSON.parse(localStorage.getItem('varc_sessions') || '[]');
         sessions.unshift({
           mode: S.type, score, max_score: maxScore, total_qs: S.questions.length,
           correct, wrong, skipped, accuracy, time_used_sec: S.totalTime,
-          marks_wasted: wrong, created_at: new Date().toISOString(), _results: results,
+          marks_wasted: wrong, created_at: _sessionCreatedAt, _results: results,
         });
         localStorage.setItem('varc_sessions', JSON.stringify(sessions.slice(0, 100)));
       } catch (e) { console.error('localStorage save failed:', e); }
@@ -4531,7 +4537,7 @@
               user_id: getUserId(), mode: S.type, score, max_score: maxScore,
               total_qs: S.questions.length, correct, wrong, skipped, accuracy,
               time_allotted_sec: S.secs + S.totalTime, time_used_sec: S.totalTime,
-              marks_wasted: wrong,
+              marks_wasted: wrong, created_at: _sessionCreatedAt,
             }) || [null];
             if (session?.id) {
               await supaPost('test_responses', results.map((res, i) => ({
