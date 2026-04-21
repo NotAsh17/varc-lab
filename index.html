@@ -3551,6 +3551,12 @@
       const rng = seededRng(todayStr + 'varc_daily');
       const plan = getDailyPlan(today);
 
+      // Restore today's completion state from localStorage
+      let todayDone = {};
+      try { todayDone = JSON.parse(localStorage.getItem('varc_daily_done') || '{}'); } catch (e) {}
+      // Only use if it's from today
+      if (todayDone._date !== todayStr) todayDone = { _date: todayStr };
+
       // Daily rotation uses only passages with 3+ questions (better practice sessions)
       const dailyPool = BANK.rc_passages.filter(p => p.questions.length >= 3);
       const passages = shuffle([...dailyPool], rng).slice(0, plan.rc);
@@ -3558,14 +3564,15 @@
       passages.forEach((p, i) => {
         const qCount = p.questions.length;
         const mins = rcTimeMinutes(qCount);
+        const secId = `rc${i + 1}`;
         dailySections.push({
-          id: `rc${i + 1}`,
+          id: secId,
           label: plan.rc > 1 ? `RC ${i + 1}` : 'RC Passage',
           sublabel: p.source,
           tag: `${qCount}Q · ${mins} min`,
           questions: p.questions.map(q => normQ(q, p.passage, p.id, p.source)),
           timeSecs: mins * 60,
-          done: false,
+          done: !!todayDone[secId],
         });
       });
 
@@ -3581,7 +3588,7 @@
             tag: `${vaQs.length}Q · 12 min`,
             questions: vaQs,
             timeSecs: 12 * 60,
-            done: false,
+            done: !!todayDone['va'],
           });
         }
       }
@@ -3641,9 +3648,17 @@
     }
 
     function afterDailySection(secId) {
-      // Mark section done
+      // Mark section done in memory
       const sec = dailySections.find(s => s.id === secId);
       if (sec) sec.done = true;
+
+      // Persist to localStorage so reopening daily picker remembers it
+      const todayStr = new Date().toISOString().slice(0, 10);
+      let todayDone = {};
+      try { todayDone = JSON.parse(localStorage.getItem('varc_daily_done') || '{}'); } catch (e) {}
+      if (todayDone._date !== todayStr) todayDone = { _date: todayStr };
+      todayDone[secId] = true;
+      try { localStorage.setItem('varc_daily_done', JSON.stringify(todayDone)); } catch (e) {}
 
       const remaining = dailySections.filter(s => !s.done);
 
